@@ -201,6 +201,12 @@ def get_calendar_service():
         return None
 
 
+def _to_rfc3339(dt: datetime) -> str:
+    """Конвертируем naive datetime (MSK) → RFC3339 с timezone offset для Google API"""
+    aware = dt.replace(tzinfo=TZ)
+    return aware.isoformat()
+
+
 def calendar_add_event(title, start_dt, end_dt=None, description=None):
     service = get_calendar_service()
     if not service:
@@ -210,31 +216,74 @@ def calendar_add_event(title, start_dt, end_dt=None, description=None):
     body = {
         "summary": title,
         "description": description or "",
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
-        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE},
+        "start": {"dateTime": _to_rfc3339(start_dt), "timeZone": TIMEZONE},
+        "end":   {"dateTime": _to_rfc3339(end_dt),   "timeZone": TIMEZONE},
     }
     try:
         ev = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body).execute()
+        logger.info(f"Calendar event created: {ev.get('id')} — {title}")
         return ev.get("id"), ev.get("htmlLink")
     except Exception as e:
+        logger.error(f"calendar_add_event error: {e}")
         return None, str(e)
 
 
 def calendar_list_events(start_dt, end_dt, max_results=30):
     service = get_calendar_service()
     if not service:
+        logger.error("calendar_list_events: no service")
         return [], "Google Calendar не подключён"
     try:
+        time_min = _to_rfc3339(start_dt)
+        time_max = _to_rfc3339(end_dt)
+        logger.info(f"Calendar query: {time_min} → {time_max}")
         r = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=start_dt.isoformat() + "Z",
-            timeMax=end_dt.isoformat()   + "Z",
+            timeMin=time_min,
+            timeMax=time_max,
             maxResults=max_results,
-            singleEvents=True, orderBy="startTime"
+            singleEvents=True,
+            orderBy="startTime"
         ).execute()
-        return r.get("items", []), None
+        items = r.get("items", [])
+        logger.info(f"Calendar returned {len(items)} events")
+        return items, None
     except Exception as e:
+        logger.error(f"calendar_list_events error: {e}")
         return [], str(e)
+
+
+def calendar_debug() -> str:
+    """Диагностика: показывает список всех календарей и ближайшие 5 событий"""
+    service = get_calendar_service()
+    if not service:
+        return "❌ Нет подключения к Google Calendar"
+    try:
+        # Список календарей
+        cals = service.calendarList().list().execute()
+        cal_names = [f"• {c.get('summary')} (id: {c.get('id')})" for c in cals.get("items", [])]
+
+        # Ближайшие 5 событий
+        now = datetime.now(TZ)
+        r = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=now.isoformat(),
+            maxResults=5,
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+        events = r.get("items", [])
+        ev_lines = []
+        for e in events:
+            start = e["start"].get("dateTime", e["start"].get("date"))
+            ev_lines.append(f"• {e.get('summary','?')} — {start}")
+
+        result = "📅 Календари:\n" + "\n".join(cal_names)
+        result += "\n\n📌 Ближайшие события:\n"
+        result += "\n".join(ev_lines) if ev_lines else "нет событий"
+        return result
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
 
 
 # ─── Claude Tools ─────────────────────────────────────────────────────────────
@@ -328,11 +377,11 @@ TOOLS = [
     },
     {
         "name": "get_daily_summary",
-        "description": "Сводка на день: задачи + события. Используй для 'план дня', 'что на сегодня'.",
+        "description": "Сводка на день: задачи + события из календаря. Используй для 'что сегодня', 'что завтра', 'план на [дату]'. Всегда передавай конкретную дату.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "date": {"type": "string", "description": "YYYY-MM-DD. По умолчанию сегодня."}
+                "date": {"type": "string", "description": "YYYY-MM-DD. Для 'завтра' — передай завтрашнюю дату. Для 'сегодня' — сегодняшнюю."}
             }
         }
     },
@@ -462,10 +511,12 @@ def make_system_prompt():
 
 ━━━ ПРАВИЛА ━━━
 1. Упомянул задачу → немедленно add_task (не спрашивай разрешения)
-2. Упомянул встречу/созвон/дедлайн с временем → add_calendar_event
-3. "план дня" / "что сегодня" → get_daily_summary
-4. "план недели" → get_weekly_summary
-5. После добавления — короткое подтверждение с деталями
+2. Если задача имеет конкретное ВРЕМЯ (15:00, утром и т.п.) → ОБЯЗАТЕЛЬНО вызови add_calendar_event СРАЗУ после add_task с тем же названием и временем. Без исключений.
+3. Упомянул встречу/созвон/дедлайн с временем → add_calendar_event (и add_task если это тоже задача)
+4. "план дня" / "что сегодня" → get_daily_summary
+5. "план недели" → get_weekly_summary
+6. После добавления — короткое подтверждение: что добавлено в задачи И в календарь
+7. При показе "что на завтра/сегодня" — всегда вызывай get_daily_summary с нужной датой, а не list_tasks
 
 ━━━ ФОРМАТИРОВАНИЕ ━━━
 🔴 high   🟡 medium   🟢 low
@@ -681,6 +732,15 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Опубликовано в тред «План дня Глеба»")
 
 
+async def cmd_debug_cal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика Google Calendar — показывает все календари и ближайшие события"""
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text("🔍 Проверяю Google Calendar...")
+    result = calendar_debug()
+    await update.message.reply_text(result)
+
+
 async def cmd_postweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вручную опубликовать план недели в THREAD_WEEK"""
     if not is_allowed(update.effective_user.id):
@@ -745,6 +805,7 @@ def main():
     app.add_handler(CommandHandler("tasks",    cmd_tasks))
     app.add_handler(CommandHandler("done",     cmd_done))
     app.add_handler(CommandHandler("clear",    cmd_clear))
+    app.add_handler(CommandHandler("debug_cal", cmd_debug_cal))
     app.add_handler(CommandHandler("post",     cmd_post))
     app.add_handler(CommandHandler("postweek", cmd_postweek))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
