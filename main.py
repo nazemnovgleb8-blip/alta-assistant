@@ -253,6 +253,52 @@ def calendar_list_events(start_dt, end_dt, max_results=30):
         return [], str(e)
 
 
+def calendar_delete_event(event_id: str):
+    service = get_calendar_service()
+    if not service:
+        return False, "Google Calendar не подключён"
+    try:
+        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+        logger.info(f"Calendar event deleted: {event_id}")
+        return True, None
+    except Exception as e:
+        logger.error(f"calendar_delete_event error: {e}")
+        return False, str(e)
+
+
+def calendar_update_event(event_id: str, title=None, start_dt=None, end_dt=None, description=None):
+    service = get_calendar_service()
+    if not service:
+        return False, "Google Calendar не подключён"
+    try:
+        event = service.events().get(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+        if title:
+            event["summary"] = title
+        if description is not None:
+            event["description"] = description
+        if start_dt:
+            event["start"] = {"dateTime": _to_rfc3339(start_dt), "timeZone": TIMEZONE}
+        if end_dt:
+            event["end"] = {"dateTime": _to_rfc3339(end_dt), "timeZone": TIMEZONE}
+        elif start_dt:
+            # Сдвигаем конец на то же смещение
+            old_start = event.get("start", {}).get("dateTime")
+            old_end   = event.get("end",   {}).get("dateTime")
+            if old_start and old_end:
+                from dateutil.parser import parse as dtparse
+                delta = dtparse(old_end) - dtparse(old_start)
+                new_end = start_dt + delta
+                event["end"] = {"dateTime": _to_rfc3339(new_end), "timeZone": TIMEZONE}
+        updated = service.events().update(
+            calendarId=GOOGLE_CALENDAR_ID, eventId=event_id, body=event
+        ).execute()
+        logger.info(f"Calendar event updated: {event_id}")
+        return True, updated.get("htmlLink")
+    except Exception as e:
+        logger.error(f"calendar_update_event error: {e}")
+        return False, str(e)
+
+
 def calendar_debug() -> str:
     """Диагностика: показывает список всех календарей и ближайшие 5 событий"""
     service = get_calendar_service()
@@ -376,6 +422,33 @@ TOOLS = [
         }
     },
     {
+        "name": "delete_calendar_event",
+        "description": "Удалить событие из Google Calendar по его ID. Сначала получи список событий через get_calendar_events, найди нужное по названию, затем удали по id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "ID события из поля 'id' в списке событий"},
+                "title":    {"type": "string", "description": "Название события (для подтверждения)"},
+            },
+            "required": ["event_id"]
+        }
+    },
+    {
+        "name": "update_calendar_event",
+        "description": "Изменить существующее событие в Google Calendar — перенести время, переименовать и т.д.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id":       {"type": "string", "description": "ID события"},
+                "title":          {"type": "string", "description": "Новое название (необязательно)"},
+                "start_datetime": {"type": "string", "description": "Новое время начала YYYY-MM-DD HH:MM (необязательно)"},
+                "end_datetime":   {"type": "string", "description": "Новое время окончания YYYY-MM-DD HH:MM (необязательно)"},
+                "description":    {"type": "string", "description": "Новое описание (необязательно)"},
+            },
+            "required": ["event_id"]
+        }
+    },
+    {
         "name": "get_daily_summary",
         "description": "Сводка на день: задачи + события из календаря. Используй для 'что сегодня', 'что завтра', 'план на [дату]'. Всегда передавай конкретную дату.",
         "input_schema": {
@@ -460,6 +533,27 @@ def execute_tool(name: str, inp: dict) -> dict:
              "id":    e.get("id", "")}
             for e in events
         ], "count": len(events)}
+
+    elif name == "delete_calendar_event":
+        ok, err = calendar_delete_event(inp["event_id"])
+        return {"ok": ok, "error": err}
+
+    elif name == "update_calendar_event":
+        try:
+            start_dt = (datetime.strptime(inp["start_datetime"], "%Y-%m-%d %H:%M")
+                        if inp.get("start_datetime") else None)
+            end_dt   = (datetime.strptime(inp["end_datetime"],   "%Y-%m-%d %H:%M")
+                        if inp.get("end_datetime")   else None)
+            ok, link = calendar_update_event(
+                event_id=inp["event_id"],
+                title=inp.get("title"),
+                start_dt=start_dt,
+                end_dt=end_dt,
+                description=inp.get("description"),
+            )
+            return {"ok": ok, "link": link}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     elif name == "get_daily_summary":
         target = inp.get("date", str(today))
