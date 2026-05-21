@@ -11,6 +11,7 @@ import logging
 import pickle
 import asyncio
 import base64
+import tempfile
 from datetime import datetime, timedelta, date, time as dtime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -850,6 +851,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_reply(update, context, text)
 
 
+# ─── Voice transcription ──────────────────────────────────────────────────────
+async def transcribe_voice(file_bytes: bytes) -> str | None:
+    """Транскрибируем OGG голосовое через Google Speech Recognition"""
+    try:
+        import speech_recognition as sr
+        from pydub import AudioSegment
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ogg_path = os.path.join(tmp, "voice.ogg")
+            wav_path = os.path.join(tmp, "voice.wav")
+
+            with open(ogg_path, "wb") as f:
+                f.write(file_bytes)
+
+            # OGG/OPUS → WAV
+            audio = AudioSegment.from_ogg(ogg_path)
+            audio.export(wav_path, format="wav")
+
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(wav_path) as source:
+                audio_data = recognizer.record(source)
+
+            text = recognizer.recognize_google(audio_data, language="ru-RU")
+            logger.info(f"Voice transcribed: {text[:80]}")
+            return text
+
+    except sr.UnknownValueError:
+        return None  # речь не распознана
+    except Exception as e:
+        logger.error(f"Voice transcription error: {e}")
+        return None
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка голосовых сообщений"""
+    if not update.message or not update.message.voice:
+        return
+    if not is_allowed(update.effective_user.id):
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    voice = update.message.voice
+    tg_file = await context.bot.get_file(voice.file_id)
+
+    # Скачиваем голосовое
+    import io
+    buf = io.BytesIO()
+    await tg_file.download_to_memory(buf)
+    file_bytes = buf.getvalue()
+
+    text = await transcribe_voice(file_bytes)
+
+    if not text:
+        await update.message.reply_text("🎤 Не удалось распознать речь. Попробуй ещё раз или напиши текстом.")
+        return
+
+    # Показываем что распознали
+    await update.message.reply_text(f"🎤 _{text}_", parse_mode="Markdown")
+
+    # Обрабатываем как обычное текстовое сообщение
+    thread_context = get_thread_context(update)
+    if thread_context == "day":
+        text = f"[Сообщение из треда ПЛАН ДНЯ] {text}"
+    elif thread_context == "week":
+        text = f"[Сообщение из треда ПЛАН НЕДЕЛИ] {text}"
+
+    await send_reply(update, context, text)
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
     """Запускаем планировщик после инициализации приложения"""
@@ -883,6 +954,7 @@ def main():
     app.add_handler(CommandHandler("post",     cmd_post))
     app.add_handler(CommandHandler("postweek", cmd_postweek))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     logger.info("🤖 Бот запущен.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
