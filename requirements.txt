@@ -5,3 +5,5 @@ google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
 python-dotenv==1.0.1
 python-dateutil>=2.8.0
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
