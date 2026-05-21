@@ -598,6 +598,8 @@ def make_system_prompt():
     return f"""Ты — бизнес-ассистент Глеба (Макс). Русский, кратко, по делу.
 Сегодня: {day_names[today.weekday()]} {today.strftime('%d.%m.%Y')} | Завтра: {tomorrow.strftime('%d.%m.%Y')} (МСК)
 
+Голосовые сообщения поддерживаются — они автоматически транскрибируются в текст перед отправкой тебе. Не говори что не умеешь голосовые.
+
 ПРАВИЛА (строго):
 - Задача упомянута → add_task немедленно
 - Задача с конкретным временем → add_task + add_calendar_event (оба вызова)
@@ -908,17 +910,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🎤 Не удалось распознать речь. Попробуй ещё раз или напиши текстом.")
         return
 
-    # Показываем что распознали
-    await update.message.reply_text(f"🎤 _{text}_", parse_mode="Markdown")
-
-    # Обрабатываем как обычное текстовое сообщение
+    # Передаём транскрипцию напрямую в агента — без публичного вывода
     thread_context = get_thread_context(update)
+    prompt = text
     if thread_context == "day":
-        text = f"[Сообщение из треда ПЛАН ДНЯ] {text}"
+        prompt = f"[Сообщение из треда ПЛАН ДНЯ] {text}"
     elif thread_context == "week":
-        text = f"[Сообщение из треда ПЛАН НЕДЕЛИ] {text}"
+        prompt = f"[Сообщение из треда ПЛАН НЕДЕЛИ] {text}"
 
-    await send_reply(update, context, text)
+    await send_reply(update, context, prompt)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
