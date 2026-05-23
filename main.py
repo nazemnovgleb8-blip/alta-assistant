@@ -51,7 +51,7 @@ AUTO_MORNING_TIME  = os.getenv("AUTO_MORNING_TIME", "09:00")
 AUTO_WEEKLY_DAY    = os.getenv("AUTO_WEEKLY_DAY", "monday")
 AUTO_WEEKLY_TIME   = os.getenv("AUTO_WEEKLY_TIME", "08:30")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # можно переопределить через переменную Railway
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # можно переопределить через переменную Railway
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
