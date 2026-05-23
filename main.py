@@ -24,8 +24,8 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-import google.generativeai as genai
-from google.generativeai.types import FunctionDeclaration, Tool
+from google import genai
+from google.genai import types as gtypes
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 
@@ -33,7 +33,7 @@ load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 GROUP_ID           = int(os.getenv("GROUP_ID", "0"))
@@ -51,7 +51,7 @@ AUTO_MORNING_TIME  = os.getenv("AUTO_MORNING_TIME", "09:00")
 AUTO_WEEKLY_DAY    = os.getenv("AUTO_WEEKLY_DAY", "monday")
 AUTO_WEEKLY_TIME   = os.getenv("AUTO_WEEKLY_TIME", "08:30")
 
-GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"  # Умный, быстрый
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # можно переопределить через переменную Railway
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -59,8 +59,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация Gemini
-genai.configure(api_key=GEMINI_API_KEY)
+# Инициализация Gemini (новый SDK google-genai)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Восстанавливаем token.pickle из base64 (для Railway)
 _token_b64 = os.getenv("GOOGLE_TOKEN_BASE64")
@@ -442,141 +442,91 @@ def execute_tool(name: str, inp: dict) -> dict:
     return {"error": f"Unknown tool: {name}"}
 
 
-# ─── Gemini Tools Definition ──────────────────────────────────────────────────
-GEMINI_TOOLS = [
-    FunctionDeclaration(
-        name="add_task",
-        description="Добавить задачу в трекер. Вызывай когда пользователь упоминает задачу, дело, цель, todo.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "title":       {"type": "string", "description": "Название задачи"},
-                "description": {"type": "string", "description": "Подробности"},
-                "due_date":    {"type": "string", "description": "YYYY-MM-DD"},
-                "due_time":    {"type": "string", "description": "HH:MM"},
-                "priority":    {"type": "string", "enum": ["high", "medium", "low"]},
-                "period":      {"type": "string", "enum": ["day", "week", "month"]},
-            },
-            "required": ["title"]
-        }
-    ),
-    FunctionDeclaration(
-        name="list_tasks",
-        description="Получить список задач.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "period": {"type": "string", "enum": ["day", "week", "month", "all"]},
-                "status": {"type": "string", "enum": ["pending", "completed", "all"]},
-            }
-        }
-    ),
-    FunctionDeclaration(
-        name="complete_task",
-        description="Отметить задачу как выполненную.",
-        parameters={
-            "type": "object",
-            "properties": {"task_id": {"type": "integer"}},
-            "required": ["task_id"]
-        }
-    ),
-    FunctionDeclaration(
-        name="delete_task",
-        description="Удалить задачу.",
-        parameters={
-            "type": "object",
-            "properties": {"task_id": {"type": "integer"}},
-            "required": ["task_id"]
-        }
-    ),
-    FunctionDeclaration(
-        name="update_task",
-        description="Обновить задачу.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "task_id":     {"type": "integer"},
-                "title":       {"type": "string"},
-                "description": {"type": "string"},
-                "due_date":    {"type": "string"},
-                "due_time":    {"type": "string"},
-                "priority":    {"type": "string", "enum": ["high", "medium", "low"]},
-                "period":      {"type": "string", "enum": ["day", "week", "month"]},
-            },
-            "required": ["task_id"]
-        }
-    ),
-    FunctionDeclaration(
-        name="add_calendar_event",
-        description="Добавить событие/встречу/созвон в Google Calendar.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "title":          {"type": "string"},
-                "start_datetime": {"type": "string", "description": "YYYY-MM-DD HH:MM"},
-                "end_datetime":   {"type": "string", "description": "YYYY-MM-DD HH:MM"},
-                "description":    {"type": "string"},
-            },
-            "required": ["title", "start_datetime"]
-        }
-    ),
-    FunctionDeclaration(
-        name="get_calendar_events",
-        description="Получить события из Google Calendar.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "period": {"type": "string", "enum": ["today", "tomorrow", "week", "month"]}
-            },
-            "required": ["period"]
-        }
-    ),
-    FunctionDeclaration(
-        name="delete_calendar_event",
-        description="Удалить событие из Calendar. Сначала найди через get_calendar_events, потом удали по id.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "event_id": {"type": "string"},
-                "title":    {"type": "string"},
-            },
-            "required": ["event_id"]
-        }
-    ),
-    FunctionDeclaration(
-        name="update_calendar_event",
-        description="Изменить/перенести событие в Calendar.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "event_id":       {"type": "string"},
-                "title":          {"type": "string"},
-                "start_datetime": {"type": "string", "description": "YYYY-MM-DD HH:MM"},
-                "end_datetime":   {"type": "string", "description": "YYYY-MM-DD HH:MM"},
-                "description":    {"type": "string"},
-            },
-            "required": ["event_id"]
-        }
-    ),
-    FunctionDeclaration(
-        name="get_daily_summary",
-        description="Полная сводка на день: задачи + события. Для 'сегодня'/'завтра' — всегда передавай дату.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "YYYY-MM-DD"}
-            },
-            "required": ["date"]
-        }
-    ),
-    FunctionDeclaration(
-        name="get_weekly_summary",
-        description="Полная сводка на неделю.",
-        parameters={"type": "object", "properties": {}}
-    ),
+# ─── Gemini Tools Definition (новый SDK google-genai) ────────────────────────
+def _schema(**props_required) -> dict:
+    """Хелпер для создания схемы параметров"""
+    properties, required = props_required.get("properties", {}), props_required.get("required", [])
+    return {"type": "object", "properties": properties, "required": required}
+
+GEMINI_FUNCTIONS = [
+    {"name": "add_task",
+     "description": "Добавить задачу в трекер. Вызывай когда пользователь упоминает задачу, дело, цель, todo.",
+     "parameters": {"type": "object", "required": ["title"], "properties": {
+         "title":       {"type": "string"},
+         "description": {"type": "string"},
+         "due_date":    {"type": "string", "description": "YYYY-MM-DD"},
+         "due_time":    {"type": "string", "description": "HH:MM"},
+         "priority":    {"type": "string", "enum": ["high", "medium", "low"]},
+         "period":      {"type": "string", "enum": ["day", "week", "month"]},
+     }}},
+    {"name": "list_tasks",
+     "description": "Получить список задач.",
+     "parameters": {"type": "object", "properties": {
+         "period": {"type": "string", "enum": ["day", "week", "month", "all"]},
+         "status": {"type": "string", "enum": ["pending", "completed", "all"]},
+     }}},
+    {"name": "complete_task",
+     "description": "Отметить задачу как выполненную.",
+     "parameters": {"type": "object", "required": ["task_id"], "properties": {
+         "task_id": {"type": "integer"},
+     }}},
+    {"name": "delete_task",
+     "description": "Удалить задачу по ID.",
+     "parameters": {"type": "object", "required": ["task_id"], "properties": {
+         "task_id": {"type": "integer"},
+     }}},
+    {"name": "update_task",
+     "description": "Обновить задачу.",
+     "parameters": {"type": "object", "required": ["task_id"], "properties": {
+         "task_id":     {"type": "integer"},
+         "title":       {"type": "string"},
+         "description": {"type": "string"},
+         "due_date":    {"type": "string"},
+         "due_time":    {"type": "string"},
+         "priority":    {"type": "string", "enum": ["high", "medium", "low"]},
+         "period":      {"type": "string", "enum": ["day", "week", "month"]},
+     }}},
+    {"name": "add_calendar_event",
+     "description": "Добавить событие/встречу/созвон в Google Calendar.",
+     "parameters": {"type": "object", "required": ["title", "start_datetime"], "properties": {
+         "title":          {"type": "string"},
+         "start_datetime": {"type": "string", "description": "YYYY-MM-DD HH:MM"},
+         "end_datetime":   {"type": "string", "description": "YYYY-MM-DD HH:MM"},
+         "description":    {"type": "string"},
+     }}},
+    {"name": "get_calendar_events",
+     "description": "Получить события из Google Calendar.",
+     "parameters": {"type": "object", "required": ["period"], "properties": {
+         "period": {"type": "string", "enum": ["today", "tomorrow", "week", "month"]},
+     }}},
+    {"name": "delete_calendar_event",
+     "description": "Удалить событие из Calendar. Сначала найди через get_calendar_events, потом удали по event_id.",
+     "parameters": {"type": "object", "required": ["event_id"], "properties": {
+         "event_id": {"type": "string"},
+         "title":    {"type": "string"},
+     }}},
+    {"name": "update_calendar_event",
+     "description": "Изменить/перенести событие в Calendar.",
+     "parameters": {"type": "object", "required": ["event_id"], "properties": {
+         "event_id":       {"type": "string"},
+         "title":          {"type": "string"},
+         "start_datetime": {"type": "string", "description": "YYYY-MM-DD HH:MM"},
+         "end_datetime":   {"type": "string", "description": "YYYY-MM-DD HH:MM"},
+         "description":    {"type": "string"},
+     }}},
+    {"name": "get_daily_summary",
+     "description": "Полная сводка на день: задачи + события. Всегда передавай конкретную дату.",
+     "parameters": {"type": "object", "required": ["date"], "properties": {
+         "date": {"type": "string", "description": "YYYY-MM-DD"},
+     }}},
+    {"name": "get_weekly_summary",
+     "description": "Полная сводка на неделю: задачи + события.",
+     "parameters": {"type": "object", "properties": {}}},
 ]
 
-GEMINI_TOOL_SET = Tool(function_declarations=GEMINI_TOOLS)
+GEMINI_TOOL = gtypes.Tool(
+    function_declarations=[gtypes.FunctionDeclaration(**f) for f in GEMINI_FUNCTIONS]
+)
 
 
 # ─── System Prompt ────────────────────────────────────────────────────────────
@@ -633,70 +583,68 @@ def make_system_prompt():
 Если пусто — так и пиши честно."""
 
 
-# ─── AI Agent (Gemini) ────────────────────────────────────────────────────────
+# ─── AI Agent (новый SDK google-genai) ───────────────────────────────────────
 async def process_with_gemini(user_id: int, user_message: str) -> str:
     history = db_get_history(user_id, limit=20)
+    logger.info(f"Семён: history={len(history)} msgs, model={GEMINI_MODEL}")
 
-    # Конвертируем историю в формат Gemini
-    gemini_history = []
+    # Строим список сообщений для Gemini
+    contents = []
     for role, content in history:
         gemini_role = "user" if role == "user" else "model"
-        gemini_history.append({"role": gemini_role, "parts": [{"text": content}]})
+        contents.append(gtypes.Content(
+            role=gemini_role,
+            parts=[gtypes.Part.from_text(text=content)]
+        ))
+    contents.append(gtypes.Content(
+        role="user",
+        parts=[gtypes.Part.from_text(text=user_message)]
+    ))
 
-    # Создаём модель с системным промптом
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
+    config = gtypes.GenerateContentConfig(
         system_instruction=make_system_prompt(),
-        tools=[GEMINI_TOOL_SET],
+        tools=[GEMINI_TOOL],
     )
 
-    # Начинаем чат с историей
-    chat = model.start_chat(history=gemini_history)
-
-    logger.info(f"Gemini processing, history={len(history)} msgs, model={GEMINI_MODEL}")
-
-    # Агентный цикл
-    current_message = user_message
+    # Агентный цикл: выполняем инструменты пока не получим финальный текст
     for iteration in range(15):
-        response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda m=current_message: chat.send_message(m)
+        response = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=config,
         )
 
-        # Проверяем наличие function calls
+        candidate = response.candidates[0]
         has_tool_calls = False
-        tool_results = []
+        tool_result_parts = []
 
-        for part in response.parts:
-            if hasattr(part, "function_call") and part.function_call.name:
+        for part in candidate.content.parts:
+            fc = getattr(part, "function_call", None)
+            if fc and fc.name:
                 has_tool_calls = True
-                fc = part.function_call
-                # Конвертируем proto map в dict
-                inp = dict(fc.args)
+                inp = dict(fc.args) if fc.args else {}
                 result = execute_tool(fc.name, inp)
-                logger.info(f"Tool [{fc.name}] → {result}")
-                tool_results.append({
-                    "function_response": {
-                        "name": fc.name,
-                        "response": result
-                    }
-                })
+                logger.info(f"Tool [{fc.name}] args={inp} → {result}")
+                tool_result_parts.append(
+                    gtypes.Part.from_function_response(name=fc.name, response=result)
+                )
 
-        if has_tool_calls and tool_results:
-            # Отправляем результаты инструментов обратно в чат
-            current_message = tool_results
+        if has_tool_calls and tool_result_parts:
+            # Добавляем ответ модели и результаты инструментов в историю
+            contents.append(candidate.content)
+            contents.append(gtypes.Content(role="user", parts=tool_result_parts))
         else:
             # Финальный текстовый ответ
-            final_text = response.text if hasattr(response, "text") else ""
-            if not final_text:
-                for part in response.parts:
-                    if hasattr(part, "text") and part.text:
-                        final_text += part.text
+            final_text = ""
+            for part in candidate.content.parts:
+                if hasattr(part, "text") and part.text:
+                    final_text += part.text
 
             db_save_message(user_id, "user", user_message)
             db_save_message(user_id, "assistant", final_text)
             return final_text or "Готово."
 
-    return "⚠️ Агент завис. Попробуй ещё раз."
+    return "⚠️ Семён завис — попробуй ещё раз."
 
 
 # ─── Group posting ────────────────────────────────────────────────────────────
