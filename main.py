@@ -613,6 +613,12 @@ def make_system_prompt():
 7. Перенести событие → сначала get_calendar_events, потом update_calendar_event
 8. Голосовые автотранскрибируются — отвечай на суть, не упоминай что это голосовое
 
+━━━ ЗАПРЕТЫ ━━━
+❌ НИКОГДА не говори "через X минут встреча/событие" без предварительного вызова get_calendar_events.
+❌ НИКОГДА не придумывай оставшееся время до события из головы — только из данных API.
+❌ НИКОГДА не называй прошедшее событие предстоящим.
+Если хочешь сказать сколько времени до события — сначала вызови get_calendar_events и посчитай сам.
+
 ━━━ РАЗБОР ИДЕЙ ━━━
 Глеб делится идеей: сначала 1-2 предложения о сути и ценности, потом структура.
 Если есть более простой путь — скажи прямо.
@@ -784,10 +790,15 @@ async def check_and_send_reminders(bot: Bot):
             for remind_at in [30, 15]:
                 if abs(minutes_left - remind_at) <= 2 and not db_reminder_sent(event_id, remind_at):
                     db_mark_reminder_sent(event_id, remind_at)
+                    # Показываем РЕАЛЬНОЕ оставшееся время, не захардкоженное
                     if remind_at == 30:
-                        msg = f"⏰ Через 30 минут — <b>{safe_send_text(title)}</b> в {time_str}\n\nСамое время допить кофе и собраться 💪"
+                        msg = (f"⏰ Через {minutes_left} минут — "
+                               f"<b>{safe_send_text(title)}</b> в {time_str}\n\n"
+                               f"Самое время допить кофе и собраться 💪")
                     else:
-                        msg = f"🔔 <b>{safe_send_text(title)}</b> — через 15 минут (в {time_str})\n\nПора переключаться 🎯"
+                        msg = (f"🔔 <b>{safe_send_text(title)}</b> — "
+                               f"через {minutes_left} мин (в {time_str})\n\n"
+                               f"Пора переключаться 🎯")
                     try:
                         await bot.send_message(
                             chat_id=ALLOWED_USER_ID, text=msg, parse_mode="HTML"
