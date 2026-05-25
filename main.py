@@ -223,21 +223,19 @@ def db_clear_history(user_id):
     conn.commit(); conn.close()
 
 
-def db_reminder_sent(event_id: str, minutes: int) -> bool:
-    conn = sqlite3.connect("tasks.db")
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM sent_reminders WHERE event_id=? AND minutes=?", (event_id, minutes))
-    exists = c.fetchone() is not None
-    conn.close()
-    return exists
-
-
-def db_mark_reminder_sent(event_id: str, minutes: int):
-    conn = sqlite3.connect("tasks.db")
+def db_try_claim_reminder(event_id: str, minutes: int) -> bool:
+    """
+    Атомарно пытается занять слот напоминания.
+    Возвращает True только если ЭТОТ процесс первым записал — т.е. отправлять нужно именно нам.
+    При двух одновременных инстансах Railway только один получит True.
+    """
+    conn = sqlite3.connect("tasks.db", timeout=5)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO sent_reminders (event_id, minutes) VALUES (?,?)", (event_id, minutes))
+    claimed = c.rowcount > 0  # 1 = мы первые, 0 = уже кто-то вставил
     c.execute("DELETE FROM sent_reminders WHERE sent_at < datetime('now', '-2 days')")
     conn.commit(); conn.close()
+    return claimed
 
 
 def db_was_posted(post_type: str, post_key: str) -> bool:
@@ -837,10 +835,8 @@ async def check_and_send_reminders(bot: Bot):
 
             for remind_at in [30, 15]:
                 # Срабатываем только на спуске: когда minutes_left ВОШЁЛ в [target-2, target]
-                # Т.е. НЕ раньше target, но и не позже target-2.
-                # Это гарантирует ~15 мин (13-15) и ~30 мин (28-30), не 17 и не 32.
-                if (remind_at - 2) <= minutes_left <= remind_at and not db_reminder_sent(event_id, remind_at):
-                    db_mark_reminder_sent(event_id, remind_at)
+                # db_try_claim_reminder — атомарная операция, защита от двух инстансов Railway
+                if (remind_at - 2) <= minutes_left <= remind_at and db_try_claim_reminder(event_id, remind_at):
                     if remind_at == 30:
                         msg = (f"⏰ Через {minutes_left} мин — "
                                f"<b>{safe_send_text(title)}</b> в {time_str}\n\n"
