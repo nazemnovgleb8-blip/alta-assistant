@@ -269,10 +269,12 @@ def get_calendar_service():
     try:
         with open(GOOGLE_TOKEN_FILE, "rb") as f:
             creds = pickle.load(f)
-        if creds and creds.expired and creds.refresh_token:
+        # Refresh если: истёк, невалиден, или expiry=None (токен без срока — всегда обновляем)
+        if creds and creds.refresh_token and (not creds.valid or creds.expired or creds.expiry is None):
             creds.refresh(Request())
             with open(GOOGLE_TOKEN_FILE, "wb") as f:
                 pickle.dump(creds, f)
+            logger.info("Calendar token refreshed")
         return build("calendar", "v3", credentials=creds)
     except Exception as e:
         logger.error(f"Calendar auth error: {e}")
@@ -376,11 +378,12 @@ def get_tasks_service():
     try:
         with open(GOOGLE_TOKEN_FILE, "rb") as f:
             creds = pickle.load(f)
-        if creds and creds.expired and creds.refresh_token:
+        # Refresh если: истёк, невалиден, или expiry=None (токен без срока — всегда обновляем)
+        if creds and creds.refresh_token and (not creds.valid or creds.expired or creds.expiry is None):
             creds.refresh(Request())
-            # Сохраняем обновлённый токен (как в get_calendar_service)
             with open(GOOGLE_TOKEN_FILE, "wb") as f:
                 pickle.dump(creds, f)
+            logger.info("Tasks token refreshed")
         return build("tasks", "v1", credentials=creds)
     except Exception as e:
         logger.error(f"Tasks auth error: {e}")
@@ -778,32 +781,31 @@ def make_system_prompt():
 
 Перед добавлением задачи — проверь список выше. Если задача с таким смыслом уже есть → НЕ добавляй дубль, скажи что уже есть (#ID).
 
-━━━ РАЗНИЦА: ЗАДАЧА vs СОБЫТИЕ ━━━
-📋 ЗАДАЧА (add_google_task) — дело которое нужно сделать: "позвонить Ивану", "написать отчёт", "подготовить КП"
-   → Сохраняется в Google Tasks И в локальный трекер (для напоминалок).
-   → Можно без конкретного времени, но если есть — укажи due_time.
-📅 СОБЫТИЕ (add_calendar_event) — встреча/созвон/звонок с конкретным временем начала и конца
-   → Идёт в Google Calendar как событие. Всегда есть дата + время начала.
-⚡ Встреча с конкретным временем → add_google_task + add_calendar_event (оба!)
-   Просто задача без встречи → только add_google_task
+━━━ ЗАДАЧА vs СОБЫТИЕ — ГЛАВНОЕ ПРАВИЛО ━━━
+Глеб указал время → это СОБЫТИЕ в календаре (add_calendar_event). Никакой задачи.
+Глеб НЕ указал время → это ЗАДАЧА в очереди (add_google_task). Никакого события.
+
+📅 СОБЫТИЕ = есть конкретное время ("в 10:00", "завтра в 15:30")
+   → add_calendar_event. Только это. Больше ничего.
+📋 ЗАДАЧА = нет времени, просто дело в очереди ("написать КП", "позвонить Ивану")
+   → add_google_task. Только это. Больше ничего.
+
+❌ НИКОГДА не добавляй и задачу, и событие одновременно — это создаёт дубли.
 
 ━━━ ПРАВИЛА ДЕЙСТВИЙ ━━━
-1. Упомянута задача/дело → сразу add_google_task, проверив что дубля нет в списке выше
-2. Встреча/созвон с временем → add_google_task + add_calendar_event оба
-3. "Сегодня" / "план дня" → get_daily_summary с датой {today}
-4. "Завтра" → get_daily_summary с датой {tomorrow}
-5. "Неделя" → get_weekly_summary
-6. Удалить событие → сначала get_calendar_events, потом delete_calendar_event по id
-7. Перенести событие → сначала get_calendar_events, потом update_calendar_event
-8. Голосовые автотранскрибируются — отвечай на суть, не упоминай что это голосовое
+1. Есть время → add_calendar_event, нет времени → add_google_task. Только одно.
+2. "Сегодня" / "план дня" → get_daily_summary с датой {today}
+3. "Завтра" → get_daily_summary с датой {tomorrow}
+4. "Неделя" → get_weekly_summary
+5. Удалить событие → сначала get_calendar_events, потом delete_calendar_event по id
+6. Перенести событие → сначала get_calendar_events, потом update_calendar_event
+7. Голосовые автотранскрибируются — отвечай на суть, не упоминай что это голосовое
 
 ━━━ ЗАПРЕТЫ ━━━
-❌ НИКОГДА сам не инициируй напоминания о встречах — напоминания приходят автоматически через отдельный планировщик.
-❌ НИКОГДА не говори "через X минут встреча/событие" без предварительного вызова get_calendar_events.
-❌ НИКОГДА не придумывай оставшееся время до события из головы — только из данных API.
-❌ НИКОГДА не называй прошедшее событие предстоящим.
-❌ НИКОГДА не пиши что-то в стиле "Глеб, через 15 минут встреча!" — это делает планировщик, не ты.
-Если пользователь САМ спрашивает о времени до события — вызови get_calendar_events и посчитай точно.
+🚫 НЕ добавляй в конце сообщений фразы типа "кстати, через X минут у тебя Y" — даже если видишь это в данных календаря. Напоминания о времени рассылает только автопланировщик.
+🚫 НЕ называй прошедшее событие предстоящим.
+🚫 НЕ придумывай встречи/события/дедлайны которых нет в данных API.
+✅ Показывай события и время — только когда Глеб сам спрашивает ("что сегодня?", "план дня", "сколько до встречи?").
 
 ━━━ РАЗБОР ИДЕЙ ━━━
 Глеб делится идеей: сначала 1-2 предложения о сути и ценности, потом структура.
