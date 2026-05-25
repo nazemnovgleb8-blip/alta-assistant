@@ -124,6 +124,15 @@ def init_db():
             PRIMARY KEY (event_id, minutes)
         )
     """)
+    # Дедупликация авто-постов — переживает рестарт Railway
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS auto_posts (
+            post_type  TEXT NOT NULL,
+            post_key   TEXT NOT NULL,
+            posted_at  TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (post_type, post_key)
+        )
+    """)
     conn.commit()
     conn.close()
     logger.info("Database ready ✓")
@@ -228,6 +237,23 @@ def db_mark_reminder_sent(event_id: str, minutes: int):
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO sent_reminders (event_id, minutes) VALUES (?,?)", (event_id, minutes))
     c.execute("DELETE FROM sent_reminders WHERE sent_at < datetime('now', '-2 days')")
+    conn.commit(); conn.close()
+
+
+def db_was_posted(post_type: str, post_key: str) -> bool:
+    conn = sqlite3.connect("tasks.db")
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM auto_posts WHERE post_type=? AND post_key=?", (post_type, post_key))
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def db_mark_posted(post_type: str, post_key: str):
+    conn = sqlite3.connect("tasks.db")
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO auto_posts (post_type, post_key) VALUES (?,?)", (post_type, post_key))
+    c.execute("DELETE FROM auto_posts WHERE posted_at < datetime('now', '-30 days')")
     conn.commit(); conn.close()
 
 
@@ -399,6 +425,16 @@ def execute_tool(name: str, inp: dict) -> dict:
     elif name == "add_calendar_event":
         try:
             start_dt = datetime.strptime(inp["start_datetime"], "%Y-%m-%d %H:%M")
+            # Проверяем дубли: ищем событие с таким же названием в окне ±2 часа
+            existing, _ = calendar_list_events(
+                start_dt - timedelta(hours=2),
+                start_dt + timedelta(hours=2),
+                max_results=20
+            )
+            for ev in existing:
+                if ev.get("summary", "").strip().lower() == inp["title"].strip().lower():
+                    return {"ok": False, "duplicate": True,
+                            "message": f"Событие '{inp['title']}' уже есть в календаре на это время. Не добавляю дубль."}
             end_dt = (datetime.strptime(inp["end_datetime"], "%Y-%m-%d %H:%M")
                       if inp.get("end_datetime") else None)
             eid, link = calendar_add_event(inp["title"], start_dt, end_dt, inp.get("description"))
@@ -742,22 +778,32 @@ async def post_to_thread(bot: Bot, text: str, thread_id: int):
 async def generate_day_plan(user_id: int) -> str:
     today = date.today()
     day_names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
-    return await process_with_gemini(
+    result = await process_with_gemini(
         user_id,
         f"Сгенерируй план дня для публикации в группу на {day_names[today.weekday()]} {today.strftime('%d.%m.%Y')}. "
         "Вызови get_daily_summary. Формат: заголовок с датой, события из календаря со временем, "
         "задачи по приоритетам. Чётко, без воды.",
-        save_history=False  # не засоряем историю диалога
+        save_history=False
     )
+    # Запоминаем факт публикации — чтобы бот знал что план уже был опубликован
+    now = datetime.now(TZ)
+    db_save_message(user_id, "assistant",
+        f"[Система] Автоматически опубликовал план дня в группу в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
+    return result
 
 
 async def generate_week_plan(user_id: int) -> str:
-    return await process_with_gemini(
+    today = date.today()
+    result = await process_with_gemini(
         user_id,
         "Сгенерируй план недели для публикации в группу. "
         "Вызови get_weekly_summary. Заголовок с датами, события и задачи структурированно.",
         save_history=False
     )
+    now = datetime.now(TZ)
+    db_save_message(user_id, "assistant",
+        f"[Система] Автоматически опубликовал план недели в группу в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
+    return result
 
 
 # ─── Напоминалки ──────────────────────────────────────────────────────────────
@@ -817,35 +863,38 @@ async def check_and_send_reminders(bot: Bot):
 
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 async def scheduler_loop(bot: Bot):
-    posted_today = {"morning": None, "weekly": None}
     while True:
         now = datetime.now(TZ)
         today_key = str(now.date())
 
         await check_and_send_reminders(bot)
 
-        morning_h, morning_m = map(int, AUTO_MORNING_TIME.split(":"))
-        if now.hour == morning_h and now.minute == morning_m and posted_today["morning"] != today_key:
-            try:
-                text = await generate_day_plan(ALLOWED_USER_ID)
-                await post_to_thread(bot, text, THREAD_DAY)
-                posted_today["morning"] = today_key
-            except Exception as e:
-                logger.error(f"Morning post error: {e}")
+        if AUTO_POST_ENABLED:
+            morning_h, morning_m = map(int, AUTO_MORNING_TIME.split(":"))
+            # Дедупликация через БД — переживает рестарты Railway
+            if now.hour == morning_h and now.minute == morning_m and not db_was_posted("morning", today_key):
+                try:
+                    db_mark_posted("morning", today_key)  # помечаем ДО генерации чтобы не дублировать при ошибке
+                    text = await generate_day_plan(ALLOWED_USER_ID)
+                    await post_to_thread(bot, text, THREAD_DAY)
+                    logger.info(f"Morning post done: {today_key}")
+                except Exception as e:
+                    logger.error(f"Morning post error: {e}")
 
-        weekly_h, weekly_m = map(int, AUTO_WEEKLY_TIME.split(":"))
-        day_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,
-                   "friday":4,"saturday":5,"sunday":6}
-        week_key = f"week-{now.isocalendar()[1]}"
-        if (now.weekday() == day_map.get(AUTO_WEEKLY_DAY.lower(), 0)
-                and now.hour == weekly_h and now.minute == weekly_m
-                and posted_today["weekly"] != week_key):
-            try:
-                text = await generate_week_plan(ALLOWED_USER_ID)
-                await post_to_thread(bot, text, THREAD_WEEK)
-                posted_today["weekly"] = week_key
-            except Exception as e:
-                logger.error(f"Weekly post error: {e}")
+            weekly_h, weekly_m = map(int, AUTO_WEEKLY_TIME.split(":"))
+            day_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,
+                       "friday":4,"saturday":5,"sunday":6}
+            week_key = f"week-{now.isocalendar()[1]}"
+            if (now.weekday() == day_map.get(AUTO_WEEKLY_DAY.lower(), 0)
+                    and now.hour == weekly_h and now.minute == weekly_m
+                    and not db_was_posted("weekly", week_key)):
+                try:
+                    db_mark_posted("weekly", week_key)
+                    text = await generate_week_plan(ALLOWED_USER_ID)
+                    await post_to_thread(bot, text, THREAD_WEEK)
+                    logger.info(f"Weekly post done: {week_key}")
+                except Exception as e:
+                    logger.error(f"Weekly post error: {e}")
 
         await asyncio.sleep(60)
 
