@@ -54,6 +54,13 @@ AUTO_WEEKLY_DAY    = os.getenv("AUTO_WEEKLY_DAY", "monday")
 AUTO_WEEKLY_TIME   = os.getenv("AUTO_WEEKLY_TIME", "08:30")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+VERSION = "5.6"
+
+AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
+AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
+
+# Путь к БД — берём из переменной, чтобы Railway Volume можно было подключить
+DB_PATH = os.getenv("DB_PATH", "tasks.db")
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -91,7 +98,7 @@ def safe_send_text(text: str) -> str:
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 def init_db():
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
@@ -140,7 +147,7 @@ def init_db():
 
 def db_add_task(title, description=None, due_date=None, due_time=None,
                 priority="medium", period="day"):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         "INSERT INTO tasks (title,description,due_date,due_time,priority,period) VALUES (?,?,?,?,?,?)",
@@ -152,7 +159,7 @@ def db_add_task(title, description=None, due_date=None, due_time=None,
 
 
 def db_list_tasks(period=None, status="pending"):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if status == "all":
         query, params = "SELECT * FROM tasks WHERE 1=1", []
@@ -167,7 +174,7 @@ def db_list_tasks(period=None, status="pending"):
 
 
 def db_complete_task(task_id):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE tasks SET status='completed', completed_at=datetime('now') WHERE id=?", (task_id,))
     ok = c.rowcount > 0; conn.commit(); conn.close()
@@ -175,7 +182,7 @@ def db_complete_task(task_id):
 
 
 def db_delete_task(task_id):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM tasks WHERE id=?", (task_id,))
     ok = c.rowcount > 0; conn.commit(); conn.close()
@@ -184,7 +191,7 @@ def db_delete_task(task_id):
 
 def db_update_task(task_id, **kwargs):
     if not kwargs: return False
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     fields = ", ".join(f"{k}=?" for k in kwargs)
     values = list(kwargs.values()) + [task_id]
@@ -194,7 +201,7 @@ def db_update_task(task_id, **kwargs):
 
 
 def db_get_history(user_id, limit=20):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         "SELECT role,content FROM chat_history WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
@@ -205,7 +212,7 @@ def db_get_history(user_id, limit=20):
 
 
 def db_save_message(user_id, role, content):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT INTO chat_history (user_id,role,content) VALUES (?,?,?)", (user_id, role, content))
     c.execute(
@@ -217,7 +224,7 @@ def db_save_message(user_id, role, content):
 
 
 def db_clear_history(user_id):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM chat_history WHERE user_id=?", (user_id,))
     conn.commit(); conn.close()
@@ -229,7 +236,7 @@ def db_try_claim_reminder(event_id: str, minutes: int) -> bool:
     Возвращает True только если ЭТОТ процесс первым записал — т.е. отправлять нужно именно нам.
     При двух одновременных инстансах Railway только один получит True.
     """
-    conn = sqlite3.connect("tasks.db", timeout=5)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO sent_reminders (event_id, minutes) VALUES (?,?)", (event_id, minutes))
     claimed = c.rowcount > 0  # 1 = мы первые, 0 = уже кто-то вставил
@@ -239,7 +246,7 @@ def db_try_claim_reminder(event_id: str, minutes: int) -> bool:
 
 
 def db_was_posted(post_type: str, post_key: str) -> bool:
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT 1 FROM auto_posts WHERE post_type=? AND post_key=?", (post_type, post_key))
     exists = c.fetchone() is not None
@@ -248,7 +255,7 @@ def db_was_posted(post_type: str, post_key: str) -> bool:
 
 
 def db_mark_posted(post_type: str, post_key: str):
-    conn = sqlite3.connect("tasks.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO auto_posts (post_type, post_key) VALUES (?,?)", (post_type, post_key))
     c.execute("DELETE FROM auto_posts WHERE posted_at < datetime('now', '-30 days')")
@@ -359,6 +366,76 @@ def calendar_update_event(event_id, title=None, start_dt=None, end_dt=None, desc
         return True, updated.get("htmlLink")
     except Exception as e:
         logger.error(f"calendar_update_event: {e}")
+        return False, str(e)
+
+
+# ─── Google Tasks ─────────────────────────────────────────────────────────────
+def get_tasks_service():
+    if not os.path.exists(GOOGLE_TOKEN_FILE):
+        return None
+    try:
+        with open(GOOGLE_TOKEN_FILE, "rb") as f:
+            creds = pickle.load(f)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Сохраняем обновлённый токен (как в get_calendar_service)
+            with open(GOOGLE_TOKEN_FILE, "wb") as f:
+                pickle.dump(creds, f)
+        return build("tasks", "v1", credentials=creds)
+    except Exception as e:
+        logger.error(f"Tasks auth error: {e}")
+        return None
+
+
+def gtasks_add(title: str, due_date: str = None, due_time: str = None, notes: str = None):
+    service = get_tasks_service()
+    if not service:
+        return None, "Google Tasks не подключён (нужна переавторизация)"
+    try:
+        body = {"title": title}
+        if notes:
+            body["notes"] = notes
+        if due_date:
+            if due_time:
+                dt = datetime.strptime(f"{due_date} {due_time}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+            else:
+                dt = datetime.strptime(due_date, "%Y-%m-%d").replace(tzinfo=TZ)
+            # Google Tasks хранит due в RFC3339 (только дата, время игнорируется в API)
+            body["due"] = dt.strftime("%Y-%m-%dT00:00:00.000Z")
+        task = service.tasks().insert(tasklist="@default", body=body).execute()
+        logger.info(f"Google Task добавлена: {title}")
+        return task.get("id"), None
+    except Exception as e:
+        logger.error(f"gtasks_add: {e}")
+        return None, str(e)
+
+
+def gtasks_list(show_completed: bool = False):
+    service = get_tasks_service()
+    if not service:
+        return [], "Google Tasks не подключён"
+    try:
+        result = service.tasks().list(
+            tasklist="@default",
+            showCompleted=show_completed,
+            showHidden=False,
+            maxResults=50
+        ).execute()
+        return result.get("items", []), None
+    except Exception as e:
+        return [], str(e)
+
+
+def gtasks_complete(task_id: str):
+    service = get_tasks_service()
+    if not service:
+        return False, "Google Tasks не подключён"
+    try:
+        task = service.tasks().get(tasklist="@default", taskId=task_id).execute()
+        task["status"] = "completed"
+        service.tasks().update(tasklist="@default", taskId=task_id, body=task).execute()
+        return True, None
+    except Exception as e:
         return False, str(e)
 
 
@@ -508,9 +585,10 @@ def execute_tool(name: str, inp: dict) -> dict:
     elif name == "get_weekly_summary":
         week_tasks = db_list_tasks(period="week", status="pending")
         day_tasks  = db_list_tasks(period="day",  status="pending")
+        now_naive  = datetime.now(TZ).replace(tzinfo=None)  # важно: берём МСК, не UTC сервера
         events, _  = calendar_list_events(
-            datetime.now().replace(hour=0, minute=0),
-            datetime.now() + timedelta(days=7)
+            now_naive.replace(hour=0, minute=0),
+            now_naive + timedelta(days=7)
         )
         return {
             "week_tasks": [
@@ -530,21 +608,44 @@ def execute_tool(name: str, inp: dict) -> dict:
             "current_time": now.strftime("%H:%M"),
         }
 
+    elif name == "add_google_task":
+        gid, err = gtasks_add(
+            title=inp["title"],
+            due_date=inp.get("due_date"),
+            due_time=inp.get("due_time"),
+            notes=inp.get("notes"),
+        )
+        # Дублируем и в локальный трекер для напоминаний
+        if gid:
+            db_add_task(
+                title=inp["title"],
+                description=inp.get("notes"),
+                due_date=inp.get("due_date"),
+                due_time=inp.get("due_time"),
+                priority=inp.get("priority", "medium"),
+                period=inp.get("period", "day"),
+            )
+        return {"ok": bool(gid), "google_task_id": gid, "error": err}
+
+    elif name == "list_google_tasks":
+        items, err = gtasks_list(show_completed=inp.get("show_completed", False))
+        if err:
+            return {"error": err}
+        return {"tasks": [
+            {"id": t.get("id"), "title": t.get("title"), "due": t.get("due"),
+             "status": t.get("status"), "notes": t.get("notes", "")}
+            for t in items
+        ], "count": len(items)}
+
+    elif name == "complete_google_task":
+        ok, err = gtasks_complete(inp["task_id"])
+        return {"ok": ok, "error": err}
+
     return {"error": f"Неизвестный инструмент: {name}"}
 
 
 # ─── Gemini Tools ─────────────────────────────────────────────────────────────
 GEMINI_FUNCTIONS = [
-    {"name": "add_task",
-     "description": "Добавить задачу в трекер. Вызывай сразу как только пользователь упоминает любую задачу, дело, цель.",
-     "parameters": {"type": "object", "required": ["title"], "properties": {
-         "title":       {"type": "string", "description": "Название задачи"},
-         "description": {"type": "string", "description": "Подробности"},
-         "due_date":    {"type": "string", "description": "YYYY-MM-DD"},
-         "due_time":    {"type": "string", "description": "HH:MM"},
-         "priority":    {"type": "string", "enum": ["high", "medium", "low"]},
-         "period":      {"type": "string", "enum": ["day", "week", "month"]},
-     }}},
     {"name": "list_tasks",
      "description": "Получить список задач из трекера.",
      "parameters": {"type": "object", "properties": {
@@ -608,6 +709,27 @@ GEMINI_FUNCTIONS = [
     {"name": "get_weekly_summary",
      "description": "Полная сводка на 7 дней: задачи + события из календаря.",
      "parameters": {"type": "object", "properties": {}}},
+    {"name": "add_google_task",
+     "description": "Добавить ЗАДАЧУ в Google Tasks — отображается в Google Calendar как задача (не как событие). "
+                    "Используй для дел без конкретного времени встречи: 'написать КП', 'позвонить Ивану', 'подготовить отчёт'.",
+     "parameters": {"type": "object", "required": ["title"], "properties": {
+         "title":    {"type": "string", "description": "Название задачи"},
+         "due_date": {"type": "string", "description": "YYYY-MM-DD — к какому дню"},
+         "due_time": {"type": "string", "description": "HH:MM — к какому времени (необязательно)"},
+         "notes":    {"type": "string", "description": "Подробности / заметки"},
+         "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+         "period":   {"type": "string", "enum": ["day", "week", "month"]},
+     }}},
+    {"name": "list_google_tasks",
+     "description": "Получить список задач из Google Tasks.",
+     "parameters": {"type": "object", "properties": {
+         "show_completed": {"type": "boolean", "description": "Показать выполненные (default false)"},
+     }}},
+    {"name": "complete_google_task",
+     "description": "Отметить задачу в Google Tasks как выполненную.",
+     "parameters": {"type": "object", "required": ["task_id"], "properties": {
+         "task_id": {"type": "string", "description": "ID задачи из list_google_tasks"},
+     }}},
 ]
 
 GEMINI_TOOL = gtypes.Tool(
@@ -621,6 +743,20 @@ def make_system_prompt():
     today = now.date()
     day_names = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
     tomorrow = today + timedelta(days=1)
+
+    # Загружаем актуальные задачи — Gemini всегда знает что есть, не создаёт дубли
+    pending = db_list_tasks(status="pending")
+    if pending:
+        task_lines = []
+        for r in pending[:30]:
+            line = f"  #{r[0]} [{r[5]}] {r[1]}"
+            if r[3]: line += f" | дата: {r[3]}"
+            if r[4]: line += f" в {r[4]}"
+            if r[7]: line += f" | период: {r[7]}"
+            task_lines.append(line)
+        tasks_block = "\n".join(task_lines)
+    else:
+        tasks_block = "  (нет активных задач)"
 
     return f"""Ты — Семён, личный бизнес-ассистент Глеба. Умный, энергичный, дружелюбный.
 
@@ -637,9 +773,23 @@ def make_system_prompt():
 Про прошлое и будущее: если сейчас {now.strftime('%H:%M')}, то всё что было ДО {now.strftime('%H:%M')} — уже прошло.
 Никогда не называй прошедшее событие "предстоящим" или "впереди".
 
+━━━ АКТИВНЫЕ ЗАДАЧИ (актуально на {now.strftime('%H:%M')}) ━━━
+{tasks_block}
+
+Перед добавлением задачи — проверь список выше. Если задача с таким смыслом уже есть → НЕ добавляй дубль, скажи что уже есть (#ID).
+
+━━━ РАЗНИЦА: ЗАДАЧА vs СОБЫТИЕ ━━━
+📋 ЗАДАЧА (add_google_task) — дело которое нужно сделать: "позвонить Ивану", "написать отчёт", "подготовить КП"
+   → Сохраняется в Google Tasks И в локальный трекер (для напоминалок).
+   → Можно без конкретного времени, но если есть — укажи due_time.
+📅 СОБЫТИЕ (add_calendar_event) — встреча/созвон/звонок с конкретным временем начала и конца
+   → Идёт в Google Calendar как событие. Всегда есть дата + время начала.
+⚡ Встреча с конкретным временем → add_google_task + add_calendar_event (оба!)
+   Просто задача без встречи → только add_google_task
+
 ━━━ ПРАВИЛА ДЕЙСТВИЙ ━━━
-1. Упомянута задача → сразу add_task (не спрашивая)
-2. Событие с временем (встреча/созвон/звонок) → add_task + add_calendar_event оба
+1. Упомянута задача/дело → сразу add_google_task, проверив что дубля нет в списке выше
+2. Встреча/созвон с временем → add_google_task + add_calendar_event оба
 3. "Сегодня" / "план дня" → get_daily_summary с датой {today}
 4. "Завтра" → get_daily_summary с датой {tomorrow}
 5. "Неделя" → get_weekly_summary
@@ -791,7 +941,6 @@ async def generate_day_plan(user_id: int) -> str:
 
 
 async def generate_week_plan(user_id: int) -> str:
-    today = date.today()
     result = await process_with_gemini(
         user_id,
         "Сгенерируй план недели для публикации в группу. "
@@ -853,6 +1002,27 @@ async def check_and_send_reminders(bot: Bot):
                     except TelegramError as e:
                         logger.error(f"Reminder send error: {e}")
 
+        # Напоминания по задачам с due_time на сегодня
+        today_str = now.strftime("%Y-%m-%d")
+        tasks_today = db_list_tasks(status="pending")
+        for r in tasks_today:
+            task_id, title, _, due_date, due_time = r[0], r[1], r[2], r[3], r[4]
+            if due_date != today_str or not due_time:
+                continue
+            try:
+                task_time = datetime.strptime(f"{today_str} {due_time}", "%Y-%m-%d %H:%M")
+                task_time = task_time.replace(tzinfo=TZ)
+                mins = int((task_time - now).total_seconds() / 60)
+                event_key = f"task_{task_id}"
+                for remind_at in [30, 15]:
+                    if (remind_at - 2) <= mins <= remind_at and db_try_claim_reminder(event_key, remind_at):
+                        msg = (f"📋 Задача через {mins} мин: "
+                               f"<b>{safe_send_text(title)}</b> (в {due_time})")
+                        await bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode="HTML")
+                        logger.info(f"Task reminder: {title} в {remind_at} мин")
+            except Exception:
+                pass
+
     except Exception as e:
         logger.error(f"check_reminders error: {e}")
 
@@ -862,15 +1032,17 @@ async def scheduler_loop(bot: Bot):
     while True:
         now = datetime.now(TZ)
         today_key = str(now.date())
+        now_mins  = now.hour * 60 + now.minute  # для сравнения времён в минутах
 
         await check_and_send_reminders(bot)
 
         if AUTO_POST_ENABLED:
             morning_h, morning_m = map(int, AUTO_MORNING_TIME.split(":"))
-            # Дедупликация через БД — переживает рестарты Railway
-            if now.hour == morning_h and now.minute == morning_m and not db_was_posted("morning", today_key):
+            morning_mins = morning_h * 60 + morning_m
+            # Окно ±1 мин — гарантированно поймаем даже при дрейфе asyncio.sleep
+            if abs(now_mins - morning_mins) <= 1 and not db_was_posted("morning", today_key):
                 try:
-                    db_mark_posted("morning", today_key)  # помечаем ДО генерации чтобы не дублировать при ошибке
+                    db_mark_posted("morning", today_key)  # помечаем ДО генерации — защита от дублей
                     text = await generate_day_plan(ALLOWED_USER_ID)
                     await post_to_thread(bot, text, THREAD_DAY)
                     logger.info(f"Morning post done: {today_key}")
@@ -878,11 +1050,12 @@ async def scheduler_loop(bot: Bot):
                     logger.error(f"Morning post error: {e}")
 
             weekly_h, weekly_m = map(int, AUTO_WEEKLY_TIME.split(":"))
+            weekly_mins = weekly_h * 60 + weekly_m
             day_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,
                        "friday":4,"saturday":5,"sunday":6}
             week_key = f"week-{now.isocalendar()[1]}"
             if (now.weekday() == day_map.get(AUTO_WEEKLY_DAY.lower(), 0)
-                    and now.hour == weekly_h and now.minute == weekly_m
+                    and abs(now_mins - weekly_mins) <= 1
                     and not db_was_posted("weekly", week_key)):
                 try:
                     db_mark_posted("weekly", week_key)
@@ -892,7 +1065,28 @@ async def scheduler_loop(bot: Bot):
                 except Exception as e:
                     logger.error(f"Weekly post error: {e}")
 
-        await asyncio.sleep(60)
+        # Check-in: вечером спрашиваем как дела с задачами на сегодня
+        if AUTO_CHECKIN_ENABLED:
+            checkin_h, checkin_m = map(int, AUTO_CHECKIN_TIME.split(":"))
+            checkin_mins = checkin_h * 60 + checkin_m
+            if abs(now_mins - checkin_mins) <= 1 and not db_was_posted("checkin", today_key):
+                try:
+                    db_mark_posted("checkin", today_key)
+                    today_str = str(now.date())
+                    pending = db_list_tasks(status="pending")
+                    today_tasks = [r for r in pending
+                                   if r[3] == today_str or (r[3] is None and r[7] == "day")]
+                    if today_tasks:
+                        task_lines = "\n".join(f"• {r[1]}" for r in today_tasks[:7])
+                        msg = (f"Глеб, привет! 👋 Как дела?\n\n"
+                               f"По плану на сегодня:\n{task_lines}\n\n"
+                               f"Всё успеваешь или что-то нужно перенести? 🙌")
+                        await bot.send_message(chat_id=ALLOWED_USER_ID, text=msg)
+                        logger.info(f"Check-in sent: {today_key}")
+                except Exception as e:
+                    logger.error(f"Check-in error: {e}")
+
+        await asyncio.sleep(30)  # 30 сек — чтобы не пропустить минутное окно при дрейфе
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -931,7 +1125,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Глеб, привет! 👋 Это Семён — на связи, готов к работе!\n\n"
+        f"Глеб, привет! 👋 Это Семён v{VERSION} — на связи, готов к работе!\n\n"
         "Просто пиши или говори голосом — что нужно сделать, какие мысли крутятся, "
         "что запланировать. Разберу, структурирую, не дам забыть.\n\n"
         "Буду напоминать за 30 и 15 минут до каждой встречи 🔔\n\n"
@@ -1077,7 +1271,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    logger.info("🤖 Семён v5 запущен!")
+    logger.info(f"🤖 Семён v{VERSION} запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
