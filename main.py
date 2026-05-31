@@ -75,6 +75,31 @@ if _token_b64 and not os.path.exists(GOOGLE_TOKEN_FILE):
     logger.info("token.pickle восстановлен из GOOGLE_TOKEN_BASE64")
 
 
+# ─── Фильтр AI-напоминаний ────────────────────────────────────────────────────
+def filter_ai_reminders(text: str) -> str:
+    """
+    Последний рубеж защиты: убираем из ответа ИИ фразы вида
+    'Глеб, через 15 минут встреча!' и блоки с таймингом события.
+    Планировщик сам отправляет напоминания — ИИ не должен этого делать.
+    """
+    # "Глеб, через X минут встреча/событие/созвон..." (целая строка)
+    text = re.sub(
+        r'[А-ЯЁа-яёA-Za-z]+,?\s+через\s+\d+\s+минут[а-яё]*\s+[а-яёА-ЯЁ\w]+[^\n]*\n?',
+        '', text, flags=re.IGNORECASE
+    )
+    # строки вида "⏰ 07:00–09:30 (150 мин)" — блок с диапазоном времени события
+    text = re.sub(
+        r'[⏰🕐🔔]?\s*\d{1,2}:\d{2}[–—-]\d{1,2}:\d{2}\s*\(\d+\s*мин\)[^\n]*\n?',
+        '', text, flags=re.IGNORECASE
+    )
+    # "через X минут встреча/созвон/слот" в середине предложения
+    text = re.sub(
+        r'через\s+\d+\s+минут[а-яё]*\s+(встреч|созвон|слот|событи)\w*',
+        '', text, flags=re.IGNORECASE
+    )
+    return text.strip()
+
+
 # ─── Markdown → HTML конвертер ────────────────────────────────────────────────
 def md_to_html(text: str) -> str:
     """Конвертируем Markdown-вывод Gemini в Telegram HTML. Безопасно, без ошибок парсинга."""
@@ -818,6 +843,12 @@ def make_system_prompt():
 ━━━ ПЕРИОДЫ ЗАДАЧ ━━━
 day — сегодня | week — эта неделя | month — этот месяц
 
+━━━ ИСТОРИЯ ДИАЛОГА ━━━
+История — это контекст того что уже было сделано. Не очередь команд.
+Отвечай ТОЛЬКО на последнее сообщение Глеба.
+НЕ добавляй задачи/события из предыдущих сообщений истории — они уже обработаны.
+Если задача из истории уже есть в списке активных выше — не добавляй снова.
+
 ━━━ ФОРМАТИРОВАНИЕ ━━━
 Ответы пиши в обычном тексте с минимальным форматированием.
 Жирный текст: **слово** (используй умеренно для важного)
@@ -881,6 +912,8 @@ async def process_with_gemini(user_id: int, user_message: str, save_history: boo
                 part.text for part in candidate.content.parts
                 if hasattr(part, "text") and part.text
             )
+            # Убираем AI-напоминания о времени — их отправляет планировщик, не ИИ
+            final_text = filter_ai_reminders(final_text)
             if save_history and final_text:
                 db_save_message(user_id, "user", user_message)
                 db_save_message(user_id, "assistant", final_text)
@@ -947,7 +980,8 @@ async def generate_week_plan(user_id: int) -> str:
     result = await process_with_gemini(
         user_id,
         "Сгенерируй план недели для публикации в группу. "
-        "Вызови get_weekly_summary. Заголовок с датами, события и задачи структурированно.",
+        "Вызови get_weekly_summary. Заголовок с датами, события и задачи структурированно. "
+        "БЕЗ прогресс-баров, БЕЗ процентов выполнения, БЕЗ статистики — только сам план.",
         save_history=False
     )
     now = datetime.now(TZ)
