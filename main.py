@@ -923,9 +923,18 @@ async def process_with_gemini(user_id: int, user_message: str, save_history: boo
 
 
 # ─── Отправка сообщений (с HTML и fallback) ───────────────────────────────────
+_REMINDER_LEAK_RE = re.compile(
+    r'через\s+\d+\s+минут\w*\s+встреч',
+    re.IGNORECASE
+)
+
 async def send_html(bot_or_update, text: str, chat_id: int = None,
                     thread_id: int = None, reply_to=None):
     """Универсальная отправка: конвертируем Markdown → HTML, fallback в plain text."""
+    # ЖЕЛЕЗНЫЙ БЛОК: если в тексте утекло AI-напоминание — не отправляем вообще
+    if _REMINDER_LEAK_RE.search(text):
+        logger.warning(f"BLOCKED reminder leak in send_html: {text[:80]!r}")
+        return
     html = md_to_html(text)
     chunks = [html[i:i+4096] for i in range(0, len(html), 4096)]
     for chunk in chunks:
