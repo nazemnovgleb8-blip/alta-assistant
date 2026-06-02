@@ -48,6 +48,10 @@ THREAD_MONTH       = int(os.getenv("THREAD_MONTH", "6"))
 
 GOOGLE_TOKEN_FILE  = os.getenv("GOOGLE_TOKEN_FILE", "token.pickle")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+# OAuth client config — нужно чтобы обновлять access-токен, если в token.pickle этих полей нет
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_TOKEN_URI     = os.getenv("GOOGLE_TOKEN_URI", "https://oauth2.googleapis.com/token")
 TIMEZONE           = os.getenv("TIMEZONE", "Europe/Moscow")
 TZ                 = ZoneInfo(TIMEZONE)
 
@@ -57,7 +61,7 @@ AUTO_WEEKLY_DAY    = os.getenv("AUTO_WEEKLY_DAY", "monday")
 AUTO_WEEKLY_TIME   = os.getenv("AUTO_WEEKLY_TIME", "08:30")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-VERSION = "6.1"
+VERSION = "6.2"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -645,18 +649,51 @@ def db_mark_posted(post_type: str, post_key: str):
 
 
 # ─── Google Calendar ──────────────────────────────────────────────────────────
-def get_calendar_service():
+def _load_google_creds():
+    """
+    Загружает creds из token.pickle и при необходимости обновляет access-токен.
+    Если в pickle нет полей для refresh (client_id/secret/token_uri) — дополняет их
+    из переменных окружения (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET). Это лечит ошибку
+    'credentials do not contain the necessary fields need to refresh the access token'
+    без перегенерации токена (если refresh_token в pickle присутствует).
+    """
     if not os.path.exists(GOOGLE_TOKEN_FILE):
         return None
+    with open(GOOGLE_TOKEN_FILE, "rb") as f:
+        creds = pickle.load(f)
+    if not creds:
+        return None
+
+    # Дополняем недостающие поля для refresh из окружения
+    needs_fields = (not getattr(creds, "client_id", None)
+                    or not getattr(creds, "client_secret", None)
+                    or not getattr(creds, "token_uri", None))
+    if needs_fields and getattr(creds, "refresh_token", None) and GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+        from google.oauth2.credentials import Credentials
+        creds = Credentials(
+            token=getattr(creds, "token", None),
+            refresh_token=creds.refresh_token,
+            token_uri=getattr(creds, "token_uri", None) or GOOGLE_TOKEN_URI,
+            client_id=getattr(creds, "client_id", None) or GOOGLE_CLIENT_ID,
+            client_secret=getattr(creds, "client_secret", None) or GOOGLE_CLIENT_SECRET,
+            scopes=getattr(creds, "scopes", None),
+        )
+        logger.info("Google creds дополнены client_id/secret из окружения")
+
+    # Refresh если: истёк, невалиден, или expiry=None (токен без срока — всегда обновляем)
+    if creds.refresh_token and (not creds.valid or creds.expired or creds.expiry is None):
+        creds.refresh(Request())
+        with open(GOOGLE_TOKEN_FILE, "wb") as f:
+            pickle.dump(creds, f)
+        logger.info("Google token refreshed ✓")
+    return creds
+
+
+def get_calendar_service():
     try:
-        with open(GOOGLE_TOKEN_FILE, "rb") as f:
-            creds = pickle.load(f)
-        # Refresh если: истёк, невалиден, или expiry=None (токен без срока — всегда обновляем)
-        if creds and creds.refresh_token and (not creds.valid or creds.expired or creds.expiry is None):
-            creds.refresh(Request())
-            with open(GOOGLE_TOKEN_FILE, "wb") as f:
-                pickle.dump(creds, f)
-            logger.info("Calendar token refreshed")
+        creds = _load_google_creds()
+        if not creds:
+            return None
         return build("calendar", "v3", credentials=creds)
     except Exception as e:
         logger.error(f"Calendar auth error: {e}")
@@ -666,6 +703,22 @@ def get_calendar_service():
 def _to_rfc3339(dt: datetime) -> str:
     """naive datetime (MSK) → RFC3339 с timezone offset"""
     return dt.replace(tzinfo=TZ).isoformat()
+
+
+def _parse_user_dt(s: str) -> datetime:
+    """Толерантный разбор даты-времени из разных форматов модели/пользователя."""
+    s = (s or "").strip().replace("T", " ")
+    fmts = ["%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m %H:%M"]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(s, f)
+            if f == "%d.%m %H:%M":  # год не указан — берём текущий
+                dt = dt.replace(year=datetime.now(TZ).year)
+            return dt
+        except ValueError:
+            continue
+    from dateutil.parser import parse as dtparse
+    return dtparse(s, dayfirst=True)  # последний шанс
 
 
 def calendar_add_event(title, start_dt, end_dt=None, description=None):
@@ -755,17 +808,10 @@ def calendar_update_event(event_id, title=None, start_dt=None, end_dt=None, desc
 
 # ─── Google Tasks ─────────────────────────────────────────────────────────────
 def get_tasks_service():
-    if not os.path.exists(GOOGLE_TOKEN_FILE):
-        return None
     try:
-        with open(GOOGLE_TOKEN_FILE, "rb") as f:
-            creds = pickle.load(f)
-        # Refresh если: истёк, невалиден, или expiry=None (токен без срока — всегда обновляем)
-        if creds and creds.refresh_token and (not creds.valid or creds.expired or creds.expiry is None):
-            creds.refresh(Request())
-            with open(GOOGLE_TOKEN_FILE, "wb") as f:
-                pickle.dump(creds, f)
-            logger.info("Tasks token refreshed")
+        creds = _load_google_creds()
+        if not creds:
+            return None
         return build("tasks", "v1", credentials=creds)
     except Exception as e:
         logger.error(f"Tasks auth error: {e}")
@@ -930,7 +976,7 @@ def execute_tool(name: str, inp: dict) -> dict:
 
     elif name == "add_calendar_event":
         try:
-            start_dt = datetime.strptime(inp["start_datetime"], "%Y-%m-%d %H:%M")
+            start_dt = _parse_user_dt(inp["start_datetime"])
             # Проверяем дубли: ищем событие с таким же названием в окне ±2 часа
             existing, _ = calendar_list_events(
                 start_dt - timedelta(hours=2),
@@ -941,10 +987,11 @@ def execute_tool(name: str, inp: dict) -> dict:
                 if ev.get("summary", "").strip().lower() == inp["title"].strip().lower():
                     return {"ok": False, "duplicate": True,
                             "message": f"Событие '{inp['title']}' уже есть в календаре на это время. Не добавляю дубль."}
-            end_dt = (datetime.strptime(inp["end_datetime"], "%Y-%m-%d %H:%M")
-                      if inp.get("end_datetime") else None)
-            eid, link = calendar_add_event(inp["title"], start_dt, end_dt, inp.get("description"))
-            return {"ok": bool(eid), "event_id": eid, "title": inp["title"], "start": inp["start_datetime"]}
+            end_dt = (_parse_user_dt(inp["end_datetime"]) if inp.get("end_datetime") else None)
+            eid, err = calendar_add_event(inp["title"], start_dt, end_dt, inp.get("description"))
+            if eid:
+                return {"ok": True, "event_id": eid, "title": inp["title"], "start": inp["start_datetime"]}
+            return {"ok": False, "error": err or "не удалось создать событие"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -978,10 +1025,8 @@ def execute_tool(name: str, inp: dict) -> dict:
 
     elif name == "update_calendar_event":
         try:
-            start_dt = (datetime.strptime(inp["start_datetime"], "%Y-%m-%d %H:%M")
-                        if inp.get("start_datetime") else None)
-            end_dt   = (datetime.strptime(inp["end_datetime"],   "%Y-%m-%d %H:%M")
-                        if inp.get("end_datetime")   else None)
+            start_dt = _parse_user_dt(inp["start_datetime"]) if inp.get("start_datetime") else None
+            end_dt   = _parse_user_dt(inp["end_datetime"])   if inp.get("end_datetime")   else None
             ok, link = calendar_update_event(
                 inp["event_id"], inp.get("title"), start_dt, end_dt, inp.get("description")
             )

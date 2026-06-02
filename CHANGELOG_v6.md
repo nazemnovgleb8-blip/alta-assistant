@@ -1,3 +1,32 @@
+# Семён v6.2 — починка записи в Google Calendar
+
+**Проблема:** Семён не мог сохранять события («не получилось сохранить в календарь»).
+В логах: `credentials do not contain the necessary fields need to refresh the access token`.
+Сохранённый `token.pickle` не содержал `client_id/client_secret/token_uri`, поэтому
+по истечении access-токена (~1 час) его не получалось обновить — чтение ещё работало, запись падала.
+
+**Фикс (код):**
+- Общий загрузчик токена `_load_google_creds` достраивает недостающие поля для refresh
+  из переменных окружения `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, после чего refresh
+  снова работает, а полные creds сохраняются обратно в `token.pickle`.
+- Толерантный разбор даты события: принимает `2026-06-04 15:00`, `04.06.2026 15:00`,
+  `4.06 15:00`, ISO — модель больше не спотыкается на формате.
+- Ошибка создания события теперь возвращается наверх (видна причина), а не «глотается».
+
+**Что нужно сделать (Railway → alta-assistant → Variables):**
+```
+GOOGLE_CLIENT_ID     = <твой OAuth Client ID из Google Cloud Console>
+GOOGLE_CLIENT_SECRET = <твой OAuth Client Secret>
+```
+Берутся в Google Cloud Console → APIs & Services → Credentials → твой OAuth 2.0 Client ID
+(тот же, которым генерировался токен).
+
+**Если после этого календарь всё ещё не пишет** — значит в `token.pickle` нет и `refresh_token`.
+Тогда нужно перегенерировать токен с offline-доступом (`access_type=offline`, `prompt=consent`)
+и обновить `GOOGLE_TOKEN_BASE64`. Напиши — помогу со скриптом авторизации.
+
+---
+
 # Семён v6.1 — фиксы качества (поверх v6.0)
 
 Три проблемы из боевого теста закрыты:
