@@ -57,10 +57,18 @@ AUTO_WEEKLY_DAY    = os.getenv("AUTO_WEEKLY_DAY", "monday")
 AUTO_WEEKLY_TIME   = os.getenv("AUTO_WEEKLY_TIME", "08:30")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-VERSION = "5.6"
+VERSION = "6.0"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
+
+# Вечерняя стратегическая сводка (итог дня + идеи на завтра взглядом предпринимателя)
+AUTO_EVENING_ENABLED = os.getenv("AUTO_EVENING_ENABLED", "true").lower() == "true"
+AUTO_EVENING_TIME    = os.getenv("AUTO_EVENING_TIME", "21:00")
+# Недельный обзор идей (воскресенье)
+AUTO_IDEAREVIEW_TIME = os.getenv("AUTO_IDEAREVIEW_TIME", "19:00")
+# Большая амбициозная цель — ориентир для стратегического мышления
+BIG_GOAL = os.getenv("BIG_GOAL", "10 млн ₽ чистой прибыли")
 
 # Путь к БД — берём из переменной, чтобы Railway Volume можно было подключить
 DB_PATH = os.getenv("DB_PATH", "tasks.db")
@@ -176,18 +184,77 @@ def init_db():
             PRIMARY KEY (post_type, post_key)
         )
     """)
+    # ── v6.0 ── Бизнес-операционка: цели, проекты, идеи, ожидания ──────────────
+    # Цели и фокус. scope: month | week | day_focus | bottleneck
+    # period_key: '2026-06' (месяц) | '2026-W23' (неделя) | '2026-06-02' (день/узкое место)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS goals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope       TEXT NOT NULL,
+            text        TEXT NOT NULL,
+            period_key  TEXT,
+            status      TEXT DEFAULT 'active',
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Проекты с рейтингом: рычаг = прибыль × вероятность × стратегичность / время
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT NOT NULL,
+            status           TEXT DEFAULT 'active',
+            expected_profit  INTEGER,
+            success_prob     INTEGER,
+            time_required    INTEGER,
+            strategic_value  INTEGER,
+            comment          TEXT,
+            created_at       TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Второй мозг для идей. category: content | product | partnership | automation | other
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ideas (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            text        TEXT NOT NULL,
+            category    TEXT DEFAULT 'other',
+            status      TEXT DEFAULT 'new',
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Ожидания от других людей
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS waiting_for (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            what        TEXT NOT NULL,
+            who         TEXT,
+            due_date    TEXT,
+            status      TEXT DEFAULT 'waiting',
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+
+    # ── Миграции колонок tasks (идемпотентно) ──
+    c.execute("PRAGMA table_info(tasks)")
+    existing_cols = {row[1] for row in c.fetchall()}
+    if "energy_type" not in existing_cols:
+        # deep | comm | ops | creative | routine
+        c.execute("ALTER TABLE tasks ADD COLUMN energy_type TEXT")
+    if "project_id" not in existing_cols:
+        c.execute("ALTER TABLE tasks ADD COLUMN project_id INTEGER")
     conn.commit()
     conn.close()
-    logger.info("Database ready ✓")
+    logger.info("Database ready ✓ (v6.0 schema)")
 
 
 def db_add_task(title, description=None, due_date=None, due_time=None,
-                priority="medium", period="day"):
+                priority="medium", period="day", energy_type=None, project_id=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO tasks (title,description,due_date,due_time,priority,period) VALUES (?,?,?,?,?,?)",
-        (title, description, due_date, due_time, priority, period)
+        "INSERT INTO tasks (title,description,due_date,due_time,priority,period,energy_type,project_id) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (title, description, due_date, due_time, priority, period, energy_type, project_id)
     )
     task_id = c.lastrowid
     conn.commit(); conn.close()
@@ -232,6 +299,172 @@ def db_update_task(task_id, **kwargs):
     fields = ", ".join(f"{k}=?" for k in kwargs)
     values = list(kwargs.values()) + [task_id]
     c.execute(f"UPDATE tasks SET {fields} WHERE id=?", values)
+    ok = c.rowcount > 0; conn.commit(); conn.close()
+    return ok
+
+
+def db_tasks_completed_on(date_str):
+    """Задачи, завершённые в указанный день (для разбора план/факт)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id,title,priority,energy_type,project_id FROM tasks "
+        "WHERE status='completed' AND date(completed_at)=?",
+        (date_str,)
+    )
+    rows = c.fetchall(); conn.close()
+    return rows
+
+
+# ── Период-ключи ──
+def period_keys(now: datetime):
+    iso = now.isocalendar()
+    return {
+        "month": now.strftime("%Y-%m"),
+        "week":  f"{iso[0]}-W{iso[1]:02d}",
+        "day":   now.strftime("%Y-%m-%d"),
+    }
+
+
+# ── Цели и фокус (goals) ──
+def db_set_goal(scope, text, period_key, single=False):
+    """single=True — заменить существующую цель этого scope+period (для фокуса дня / узкого места)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if single:
+        c.execute("UPDATE goals SET status='archived' WHERE scope=? AND period_key=? AND status='active'",
+                  (scope, period_key))
+    c.execute("INSERT INTO goals (scope,text,period_key,status) VALUES (?,?,?,'active')",
+              (scope, text, period_key))
+    gid = c.lastrowid
+    conn.commit(); conn.close()
+    return gid
+
+def db_list_goals(scope=None, period_key=None, status="active"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    q, p = "SELECT id,scope,text,period_key,status FROM goals WHERE status=?", [status]
+    if scope:      q += " AND scope=?";      p.append(scope)
+    if period_key: q += " AND period_key=?"; p.append(period_key)
+    q += " ORDER BY id DESC"
+    c.execute(q, p); rows = c.fetchall(); conn.close()
+    return rows
+
+def db_complete_goal(goal_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE goals SET status='done' WHERE id=?", (goal_id,))
+    ok = c.rowcount > 0; conn.commit(); conn.close()
+    return ok
+
+
+# ── Проекты + рейтинг (рычаг) ──
+def _project_score(profit, prob, time_req, strategic):
+    """Рычаг = ожид.прибыль(норм) × вероятность × стратегичность / время. 0..100."""
+    try:
+        prob = (prob or 50) / 100.0
+        strategic = (strategic or 3)            # 1..5
+        time_req = max(time_req or 3, 1)         # 1..5 (1=быстро, 5=долго)
+        profit = max(profit or 0, 0)
+        # нормируем прибыль логарифмически чтобы не доминировала
+        import math
+        profit_n = math.log10(profit + 1) / 7.0  # ~0..1 при прибыли до 10 млн
+        raw = profit_n * prob * (strategic / 5.0) / (time_req / 5.0)
+        return round(min(raw * 100, 100), 1)
+    except Exception:
+        return 0.0
+
+def db_add_project(name, expected_profit=None, success_prob=None,
+                   time_required=None, strategic_value=None, comment=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO projects (name,expected_profit,success_prob,time_required,strategic_value,comment) "
+        "VALUES (?,?,?,?,?,?)",
+        (name, expected_profit, success_prob, time_required, strategic_value, comment)
+    )
+    pid = c.lastrowid; conn.commit(); conn.close()
+    return pid
+
+def db_update_project(project_id, **kwargs):
+    if not kwargs: return False
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    fields = ", ".join(f"{k}=?" for k in kwargs)
+    c.execute(f"UPDATE projects SET {fields} WHERE id=?", list(kwargs.values()) + [project_id])
+    ok = c.rowcount > 0; conn.commit(); conn.close()
+    return ok
+
+def db_list_projects(status="active"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if status == "all":
+        c.execute("SELECT id,name,status,expected_profit,success_prob,time_required,strategic_value,comment FROM projects")
+    else:
+        c.execute("SELECT id,name,status,expected_profit,success_prob,time_required,strategic_value,comment FROM projects WHERE status=?", (status,))
+    rows = c.fetchall(); conn.close()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r[0], "name": r[1], "status": r[2],
+            "expected_profit": r[3], "success_prob": r[4],
+            "time_required": r[5], "strategic_value": r[6], "comment": r[7],
+            "score": _project_score(r[3], r[4], r[5], r[6]),
+        })
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
+
+# ── Идеи (второй мозг) ──
+def db_add_idea(text, category="other"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO ideas (text,category) VALUES (?,?)", (text, category))
+    iid = c.lastrowid; conn.commit(); conn.close()
+    return iid
+
+def db_list_ideas(status="new", category=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    q, p = "SELECT id,text,category,status,created_at FROM ideas WHERE 1=1", []
+    if status and status != "all": q += " AND status=?";   p.append(status)
+    if category:                   q += " AND category=?"; p.append(category)
+    q += " ORDER BY id DESC"
+    c.execute(q, p); rows = c.fetchall(); conn.close()
+    return rows
+
+def db_update_idea(idea_id, **kwargs):
+    if not kwargs: return False
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    fields = ", ".join(f"{k}=?" for k in kwargs)
+    c.execute(f"UPDATE ideas SET {fields} WHERE id=?", list(kwargs.values()) + [idea_id])
+    ok = c.rowcount > 0; conn.commit(); conn.close()
+    return ok
+
+
+# ── Ожидания от других ──
+def db_add_waiting(what, who=None, due_date=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO waiting_for (what,who,due_date) VALUES (?,?,?)", (what, who, due_date))
+    wid = c.lastrowid; conn.commit(); conn.close()
+    return wid
+
+def db_list_waiting(status="waiting"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if status == "all":
+        c.execute("SELECT id,what,who,due_date,status FROM waiting_for ORDER BY id DESC")
+    else:
+        c.execute("SELECT id,what,who,due_date,status FROM waiting_for WHERE status=? ORDER BY id DESC", (status,))
+    rows = c.fetchall(); conn.close()
+    return rows
+
+def db_resolve_waiting(waiting_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE waiting_for SET status='done' WHERE id=?", (waiting_id,))
     ok = c.rowcount > 0; conn.commit(); conn.close()
     return ok
 
@@ -727,6 +960,8 @@ def execute_tool(name: str, inp: dict) -> dict:
                 due_time=inp.get("due_time"),
                 priority=inp.get("priority", "medium"),
                 period=inp.get("period", "day"),
+                energy_type=inp.get("energy_type"),
+                project_id=inp.get("project_id"),
             )
         return {"ok": bool(gid), "google_task_id": gid, "error": err}
 
@@ -750,6 +985,73 @@ def execute_tool(name: str, inp: dict) -> dict:
 
     elif name == "get_business_kpi":
         return fetch_business_kpi(force=inp.get("force", False))
+
+    # ── Цели и фокус ──
+    elif name == "set_goal":
+        scope = inp["scope"]  # month | week | day_focus | bottleneck
+        keys = period_keys(now)
+        pk = (inp.get("period_key")
+              or (keys["month"] if scope == "month"
+                  else keys["week"] if scope == "week"
+                  else keys["day"]))
+        single = scope in ("day_focus", "bottleneck")
+        gid = db_set_goal(scope, inp["text"], pk, single=single)
+        return {"ok": True, "goal_id": gid, "scope": scope, "period_key": pk}
+
+    elif name == "list_goals":
+        rows = db_list_goals(scope=inp.get("scope"), period_key=inp.get("period_key"),
+                             status=inp.get("status", "active"))
+        return {"goals": [{"id": r[0], "scope": r[1], "text": r[2],
+                           "period_key": r[3], "status": r[4]} for r in rows]}
+
+    elif name == "complete_goal":
+        return {"ok": db_complete_goal(inp["goal_id"])}
+
+    # ── Проекты + рейтинг ──
+    elif name == "add_project":
+        pid = db_add_project(
+            name=inp["name"],
+            expected_profit=inp.get("expected_profit"),
+            success_prob=inp.get("success_prob"),
+            time_required=inp.get("time_required"),
+            strategic_value=inp.get("strategic_value"),
+            comment=inp.get("comment"),
+        )
+        return {"ok": True, "project_id": pid}
+
+    elif name == "update_project":
+        pid = inp.pop("project_id")
+        return {"ok": db_update_project(pid, **inp) if inp else False}
+
+    elif name == "list_projects":
+        return {"projects": db_list_projects(status=inp.get("status", "active"))}
+
+    # ── Идеи (второй мозг) ──
+    elif name == "add_idea":
+        iid = db_add_idea(inp["text"], inp.get("category", "other"))
+        return {"ok": True, "idea_id": iid}
+
+    elif name == "list_ideas":
+        rows = db_list_ideas(status=inp.get("status", "new"), category=inp.get("category"))
+        return {"ideas": [{"id": r[0], "text": r[1], "category": r[2],
+                           "status": r[3], "created_at": r[4]} for r in rows]}
+
+    elif name == "update_idea":
+        iid = inp.pop("idea_id")
+        return {"ok": db_update_idea(iid, **inp) if inp else False}
+
+    # ── Ожидания от других ──
+    elif name == "add_waiting":
+        wid = db_add_waiting(inp["what"], inp.get("who"), inp.get("due_date"))
+        return {"ok": True, "waiting_id": wid}
+
+    elif name == "list_waiting":
+        rows = db_list_waiting(status=inp.get("status", "waiting"))
+        return {"waiting": [{"id": r[0], "what": r[1], "who": r[2],
+                             "due_date": r[3], "status": r[4]} for r in rows]}
+
+    elif name == "resolve_waiting":
+        return {"ok": db_resolve_waiting(inp["waiting_id"])}
 
     return {"error": f"Неизвестный инструмент: {name}"}
 
@@ -829,6 +1131,9 @@ GEMINI_FUNCTIONS = [
          "notes":    {"type": "string", "description": "Подробности / заметки"},
          "priority": {"type": "string", "enum": ["high", "medium", "low"]},
          "period":   {"type": "string", "enum": ["day", "week", "month"]},
+         "energy_type": {"type": "string", "enum": ["deep", "comm", "ops", "creative", "routine"],
+                         "description": "Тип нагрузки: deep=глубокая работа, comm=коммуникация/созвоны, ops=операционка, creative=креатив, routine=рутина"},
+         "project_id":  {"type": "integer", "description": "ID проекта (из list_projects), если задача относится к проекту"},
      }}},
     {"name": "list_google_tasks",
      "description": "Получить список задач из Google Tasks.",
@@ -853,6 +1158,101 @@ GEMINI_FUNCTIONS = [
                     "или когда нужно понять, что реально двигает бизнес и где узкое место.",
      "parameters": {"type": "object", "properties": {
          "force": {"type": "boolean", "description": "Принудительно обновить, минуя кэш (по умолчанию false)"},
+     }}},
+
+    # ── Цели и фокус ──
+    {"name": "set_goal",
+     "description": "Задать цель или фокус. scope: 'month' — цель месяца, 'week' — цель недели, "
+                    "'day_focus' — главный фокус дня (одна фраза), 'bottleneck' — узкое место бизнеса сейчас "
+                    "(что СИЛЬНЕЕ ВСЕГО ограничивает рост — только одно). Для day_focus и bottleneck новая запись "
+                    "заменяет предыдущую за тот же день.",
+     "parameters": {"type": "object", "required": ["scope", "text"], "properties": {
+         "scope": {"type": "string", "enum": ["month", "week", "day_focus", "bottleneck"]},
+         "text":  {"type": "string"},
+     }}},
+    {"name": "list_goals",
+     "description": "Получить активные цели/фокус/узкое место. Без scope — все.",
+     "parameters": {"type": "object", "properties": {
+         "scope":  {"type": "string", "enum": ["month", "week", "day_focus", "bottleneck"]},
+         "status": {"type": "string", "enum": ["active", "done", "archived"]},
+     }}},
+    {"name": "complete_goal",
+     "description": "Отметить цель достигнутой.",
+     "parameters": {"type": "object", "required": ["goal_id"], "properties": {
+         "goal_id": {"type": "integer"},
+     }}},
+
+    # ── Проекты + рейтинг ──
+    {"name": "add_project",
+     "description": "Добавить проект для оценки рычага. Оценки нужны чтобы понять, какой проект приносит "
+                    "максимальный эффект на вложенное время.",
+     "parameters": {"type": "object", "required": ["name"], "properties": {
+         "name":            {"type": "string"},
+         "expected_profit": {"type": "integer", "description": "Ожидаемая прибыль в ₽"},
+         "success_prob":    {"type": "integer", "description": "Вероятность успеха, 0–100"},
+         "time_required":   {"type": "integer", "description": "Сколько времени требует, 1 (быстро) – 5 (долго)"},
+         "strategic_value": {"type": "integer", "description": "Стратегическая ценность, 1–5"},
+         "comment":         {"type": "string"},
+     }}},
+    {"name": "update_project",
+     "description": "Обновить проект (оценки, статус, комментарий). status: active|paused|done|dropped.",
+     "parameters": {"type": "object", "required": ["project_id"], "properties": {
+         "project_id":      {"type": "integer"},
+         "name":            {"type": "string"},
+         "status":          {"type": "string", "enum": ["active", "paused", "done", "dropped"]},
+         "expected_profit": {"type": "integer"},
+         "success_prob":    {"type": "integer"},
+         "time_required":   {"type": "integer"},
+         "strategic_value": {"type": "integer"},
+         "comment":         {"type": "string"},
+     }}},
+    {"name": "list_projects",
+     "description": "Список проектов с рассчитанным рейтингом рычага (score, по убыванию). "
+                    "Используй чтобы сказать какой проект сейчас даёт наибольший рычаг.",
+     "parameters": {"type": "object", "properties": {
+         "status": {"type": "string", "enum": ["active", "paused", "done", "dropped", "all"]},
+     }}},
+
+    # ── Идеи (второй мозг) ──
+    {"name": "add_idea",
+     "description": "Сохранить идею в банк идей. Идея — это гипотеза, не задача. Не превращай идеи в задачи "
+                    "автоматически. category: content|product|partnership|automation|other.",
+     "parameters": {"type": "object", "required": ["text"], "properties": {
+         "text":     {"type": "string"},
+         "category": {"type": "string", "enum": ["content", "product", "partnership", "automation", "other"]},
+     }}},
+    {"name": "list_ideas",
+     "description": "Получить идеи из банка. status: new|promising|archived|all.",
+     "parameters": {"type": "object", "properties": {
+         "status":   {"type": "string", "enum": ["new", "promising", "archived", "all"]},
+         "category": {"type": "string", "enum": ["content", "product", "partnership", "automation", "other"]},
+     }}},
+    {"name": "update_idea",
+     "description": "Обновить идею (например пометить promising или archived).",
+     "parameters": {"type": "object", "required": ["idea_id"], "properties": {
+         "idea_id":  {"type": "integer"},
+         "text":     {"type": "string"},
+         "category": {"type": "string", "enum": ["content", "product", "partnership", "automation", "other"]},
+         "status":   {"type": "string", "enum": ["new", "promising", "archived"]},
+     }}},
+
+    # ── Ожидания от других ──
+    {"name": "add_waiting",
+     "description": "Зафиксировать ожидание от другого человека (кто-то должен что-то прислать/ответить/сделать).",
+     "parameters": {"type": "object", "required": ["what"], "properties": {
+         "what":     {"type": "string", "description": "Что ждём"},
+         "who":      {"type": "string", "description": "От кого"},
+         "due_date": {"type": "string", "description": "YYYY-MM-DD — к какому сроку (если есть)"},
+     }}},
+    {"name": "list_waiting",
+     "description": "Список ожиданий от других людей. status: waiting|done|all.",
+     "parameters": {"type": "object", "properties": {
+         "status": {"type": "string", "enum": ["waiting", "done", "all"]},
+     }}},
+    {"name": "resolve_waiting",
+     "description": "Закрыть ожидание (получили то, что ждали).",
+     "parameters": {"type": "object", "required": ["waiting_id"], "properties": {
+         "waiting_id": {"type": "integer"},
      }}},
 ]
 
@@ -899,13 +1299,66 @@ def make_system_prompt():
     else:
         kpi_block = "  (финансовые данные сейчас недоступны)"
 
-    return f"""Ты — Семён, личный бизнес-ассистент Глеба. Умный, энергичный, дружелюбный.
+    # ── Цели, фокус, узкое место ──
+    keys = period_keys(now)
+    month_goals = db_list_goals(scope="month",     period_key=keys["month"])
+    week_goals  = db_list_goals(scope="week",      period_key=keys["week"])
+    focus_rows  = db_list_goals(scope="day_focus", period_key=keys["day"])
+    bn_rows     = db_list_goals(scope="bottleneck", period_key=keys["day"])
+    def _goals_text(rows):
+        return "\n".join(f"  • {r[2]}" for r in rows) if rows else "  (не заданы)"
+    month_block     = _goals_text(month_goals)
+    week_block      = _goals_text(week_goals)
+    focus_text      = focus_rows[0][2] if focus_rows else "(не задан)"
+    bottleneck_text = bn_rows[0][2] if bn_rows else "(не определено)"
 
-━━━ ХАРАКТЕР ━━━
-Говоришь живо, по-человечески, без канцелярита. Верь в Глеба и его идеи.
-Подбадриваешь честно и тепло. Видишь картину шире, подсвечиваешь простые решения.
-Когда задача выполнена — радуешься вместе. Не занудствуешь.
-Эмодзи — умеренно, уместно. Кратко и по делу.
+    # ── Энергобаланс задач на сегодня ──
+    energy_labels = {"deep": "глубокая работа", "comm": "коммуникация",
+                     "ops": "операционка", "creative": "креатив", "routine": "рутина"}
+    today_str = keys["day"]
+    energy_counts = {}
+    for r in pending:
+        et = r[10] if len(r) > 10 else None
+        is_today = (r[3] == today_str) or (r[3] is None and r[7] == "day")
+        if et and is_today:
+            energy_counts[et] = energy_counts.get(et, 0) + 1
+    energy_block = (", ".join(f"{energy_labels.get(k, k)}: {v}" for k, v in energy_counts.items())
+                    if energy_counts else "(тип нагрузки у задач не проставлен)")
+
+    # ── Ожидания от других ──
+    waiting = db_list_waiting(status="waiting")
+    if waiting:
+        waiting_block = "\n".join(
+            f"  • {w[1]}" + (f" — от {w[2]}" if w[2] else "") + (f" (к {w[3]})" if w[3] else "")
+            for w in waiting[:10]
+        )
+    else:
+        waiting_block = "  (нет)"
+
+    return f"""Ты — Семён, личный бизнес-ассистент Глеба.
+Ты не чат-бот и не планировщик задач. Ты выполняешь роль сильного ассистента руководителя —
+ближе к операционному директору, чем к секретарю. Знаешь проекты, цели, людей, договорённости,
+обязательства и контекст бизнеса. Тебе не нужно показывать свою работу — Глебу нужен результат.
+
+━━━ ТОН ━━━
+Говоришь спокойно, по-человечески, уверенно. Коротко и по делу.
+Если можно сказать в одном предложении — говоришь в одном предложении.
+Если ситуация требует подробностей — объясняешь подробно.
+Не перегружаешь сообщениями. Если всё хорошо — не мешаешь. Если видишь риск — говоришь прямо.
+
+НИКОГДА не пиши канцелярит и шаблоны нейросетей. Запрещённые фразы:
+«Я проанализировал», «На основе ваших данных», «Вот структурированный отчёт»,
+«Резюмируя вышесказанное», «Ниже представлен», «Обнаружено превышение», «Выявлено несоответствие».
+Вместо «На сегодня сформирован список задач» → «На сегодня три главные вещи».
+Вместо «Обнаружено превышение нагрузки» → «На день 17 задач. Ты это не вывезешь, убери минимум пять».
+Эмодзи — умеренно, как маркеры. Без «актёрской игры» и звёздочек с действиями.
+
+━━━ ГЛАВНЫЙ ПРИНЦИП ━━━
+Ты не управляешь задачами. Ты помогаешь Глебу принимать правильные решения каждый день.
+Главное — деньги, клиенты, обязательства, репутация, стратегические цели и энергия владельца.
+Не каждая задача важна. Не каждая срочная вещь требует внимания.
+Если Глеб распыляется или уходит в операционку, забывая про продажи и развитие — ты обязан это показать.
+Ты не споришь ради спора. Но если видишь ошибку, перегруз или потерю фокуса — говоришь прямо.
 
 ━━━ ТОЧНОЕ ВРЕМЯ ━━━
 Сейчас: {now.strftime('%H:%M')} МСК | {day_names[today.weekday()]} {now.strftime('%d.%m.%Y')}
@@ -913,6 +1366,16 @@ def make_system_prompt():
 
 Про прошлое и будущее: если сейчас {now.strftime('%H:%M')}, то всё что было ДО {now.strftime('%H:%M')} — уже прошло.
 Никогда не называй прошедшее событие "предстоящим" или "впереди".
+
+━━━ ЦЕЛИ И ФОКУС ━━━
+Цель(и) месяца:
+{month_block}
+Цель(и) недели:
+{week_block}
+Фокус дня: {focus_text}
+
+Каждая задача дня должна работать на цель недели/месяца. Если задача не в фокусе — мягко подсвети это.
+Чтобы задать/изменить: set_goal (scope month|week|day_focus|bottleneck).
 
 ━━━ АКТИВНЫЕ ЗАДАЧИ (актуально на {now.strftime('%H:%M')}) ━━━
 {tasks_block}
@@ -925,6 +1388,25 @@ def make_system_prompt():
 Это живые цифры из финансовой системы. Используй их, когда речь о деньгах, продажах, кассе, лидах или долгах.
 Когда Глеб распыляется на операционку — напоминай, что реально двигает бизнес (продажи, лиды, дебиторка).
 За свежими/детальными данными вызывай get_business_kpi. Цифры не выдумывай — бери только отсюда или из инструмента.
+
+━━━ УЗКОЕ МЕСТО (что сильнее всего ограничивает рост сейчас) ━━━
+{bottleneck_text}
+
+Узкое место — всегда ОДНО. Например: нет лидов, нет продаж, кассовый разрыв, перегруз Глеба, нет менеджера, нехватка контента.
+Все твои рекомендации по приоритетам строй вокруг узкого места. Если оно не определено и у тебя есть данные — предложи определить (set_goal scope=bottleneck).
+
+━━━ ЭНЕРГОБАЛАНС НА СЕГОДНЯ ━━━
+{energy_block}
+
+Люди работают не задачами, а энергией. Типы нагрузки: глубокая работа / коммуникация / операционка / креатив / рутина.
+Если на день перекос (например 8 часов коммуникаций и 0 глубокой работы) — скажи об этом.
+Проставляй energy_type при добавлении значимых задач.
+
+━━━ ОЖИДАНИЯ ОТ ДРУГИХ ━━━
+{waiting_block}
+
+Кто кому что должен прислать/ответить. Фиксируй через add_waiting, закрывай через resolve_waiting.
+Если срок прошёл — напомни прямо: «Павел всё ещё ждёт КП» / «Рома не прислал варианты с понедельника».
 
 ━━━ ЗАДАЧА vs СОБЫТИЕ — ЖЕЛЕЗНОЕ ПРАВИЛО ━━━
 📅 СОБЫТИЕ = Глеб явно назвал время ("встреча в 15:00", "созвон завтра в 11:30")
@@ -960,9 +1442,36 @@ def make_system_prompt():
 🚫 НЕ придумывай встречи/события/дедлайны которых нет в данных API.
 ✅ Показывай события и время — только когда Глеб сам спрашивает ("что сегодня?", "план дня", "сколько до встречи?").
 
-━━━ РАЗБОР ИДЕЙ ━━━
-Глеб делится идеей: сначала 1-2 предложения о сути и ценности, потом структура.
-Если есть более простой путь — скажи прямо.
+━━━ РАЗБОР СУЩНОСТЕЙ — что куда ━━━
+Не всё, что говорит Глеб — задача. Сначала классифицируй:
+• Конкретное действие с результатом → задача (add_google_task).
+• Время названо → событие (add_calendar_event).
+• Гипотеза, «можно попробовать», «а что если» → идея (add_idea), НЕ задача.
+• «Надо бы», «когда-нибудь» → идея или заметка, не задача.
+• Кто-то другой должен что-то сделать/прислать → ожидание (add_waiting).
+• Большое направление с прибылью/сроком → проект (add_project).
+При разборе голосового/хаотичного сообщения отвечай по-человечески:
+«Поймал. Вижу две задачи, один созвон и один вопрос — по времени созвона уточни».
+Не пиши «Создано 3 задачи. Выявлено 4 сущности».
+
+━━━ ИДЕИ (второй мозг) ━━━
+Идеи Глеба — часто источник денег. Складывай их в банк идей, не теряй.
+Категории: контент / продукт / партнёрство / автоматизация / другое.
+Раз в неделю делаешь обзор: «За неделю 14 идей. Вот 3 самые перспективные».
+
+━━━ ПРОЕКТЫ И РЫЧАГ ━━━
+Не все проекты равны. У каждого: ожидаемая прибыль, вероятность, требуемое время, стратегическая ценность.
+list_projects даёт рейтинг по рычагу (score). Используй, чтобы сказать прямо:
+«Из активных проектов наибольший рычаг сейчас у X — туда и стоит вкладывать время».
+
+━━━ КОГДА СПОРИТЬ (твоя главная ценность) ━━━
+Перегруз: «На завтра 14 задач. Реально успеешь примерно половину».
+Потеря фокуса: «Последние три дня почти всё ушло в операционку. Продажами ты не занимался».
+Несоответствие цели: «Ты говорил, цель недели — продажи. Но большинство задач не про это».
+Риск: «Если сегодня не выставить счёт, деньги сдвинутся минимум на неделю».
+Возможность: «Сейчас самое выгодное вложение времени — обработать новые лиды. Остальное подождёт».
+Нет денежных задач: «Сегодня нет ни одной задачи, которая приносит деньги».
+Говори это прямо, спокойно, без драматизации. Один раз, не долби.
 
 ━━━ ПРИОРИТЕТЫ ━━━
 🔴 high — горит | 🟡 medium — важно, не срочно | 🟢 low — когда-нибудь
@@ -1107,29 +1616,87 @@ async def generate_day_plan(user_id: int) -> str:
     day_names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
     result = await process_with_gemini(
         user_id,
-        f"Сгенерируй план дня для публикации в группу на {day_names[today.weekday()]} {today.strftime('%d.%m.%Y')}. "
-        "Вызови get_daily_summary. Формат: заголовок с датой, события из календаря со временем, "
-        "задачи по приоритетам. Чётко, без воды.",
+        f"Утро. Составь план дня на {day_names[today.weekday()]} {today.strftime('%d.%m.%Y')}. "
+        f"Вызови get_daily_summary (дата {today}). Учитывай цели/фокус, узкое место и KPI из системного контекста. "
+        "Формат, по-человечески и коротко:\n"
+        "🎯 Фокус дня — одна фраза\n"
+        "Топ-3 задачи (только важное)\n"
+        "📅 Встречи со временем (или «нет»)\n"
+        "💰 Деньги — что сегодня приближает к выручке/закрывает дебиторку\n"
+        "👥 Кого пнуть / что ждём от других\n"
+        "⚠️ Риск дня (если есть)\n"
+        "Без воды, без прогресс-баров.",
         save_history=False
     )
-    # Запоминаем факт публикации — чтобы бот знал что план уже был опубликован
     now = datetime.now(TZ)
     db_save_message(user_id, "assistant",
-        f"[Система] Автоматически опубликовал план дня в группу в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
+        f"[Система] Опубликовал план дня в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
     return result
 
 
 async def generate_week_plan(user_id: int) -> str:
     result = await process_with_gemini(
         user_id,
-        "Сгенерируй план недели для публикации в группу. "
-        "Вызови get_weekly_summary. Заголовок с датами, события и задачи структурированно. "
-        "БЕЗ прогресс-баров, БЕЗ процентов выполнения, БЕЗ статистики — только сам план.",
+        "Понедельник. Составь план недели. Вызови get_weekly_summary и list_goals. "
+        "Привяжи к цели месяца. Формат:\n"
+        "🏆 Главная цель недели — одна фраза\n"
+        "💰 Денежные задачи недели (что влияет на выручку)\n"
+        "👤 Клиенты — кто ждёт, кому написать\n"
+        "📅 Ключевые встречи\n"
+        "⚠️ Риски недели\n"
+        "БЕЗ прогресс-баров, БЕЗ процентов — только план.",
         save_history=False
     )
     now = datetime.now(TZ)
     db_save_message(user_id, "assistant",
-        f"[Система] Автоматически опубликовал план недели в группу в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
+        f"[Система] Опубликовал план недели в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
+    return result
+
+
+async def generate_evening_report(user_id: int) -> str:
+    """
+    Вечерняя сводка: итог дня + взгляд опытного предпринимателя-стратега.
+    Семён фоново думает, как выйти на новый уровень (к BIG_GOAL), и предлагает
+    мощные амбициозные идеи на завтра. Лучшие идеи сохраняет в банк идей.
+    """
+    today = date.today()
+    result = await process_with_gemini(
+        user_id,
+        f"Вечер {today.strftime('%d.%m.%Y')}. Подведи итог дня и подумай как сильный предприниматель-стратег.\n"
+        "Сначала вызови get_daily_summary (дата сегодня), list_waiting и get_business_kpi.\n\n"
+        "Часть 1 — Итог дня (коротко, по-человечески):\n"
+        "✅ Сделано\n"
+        "❌ Не успели + почему\n"
+        "➡️ Переносим на завтра\n"
+        "🧠 Решения / 👀 что ждём от других\n\n"
+        f"Часть 2 — Взгляд стратега со стороны (главное!). Цель — {BIG_GOAL}.\n"
+        "Подумай амбициозно: что реально выведет бизнес на новый уровень, а не косметика. "
+        "Опираясь на узкое место и KPI, предложи 2-3 мощные, смелые идеи/хода на завтра и ближайшее время — "
+        "как опытный предприниматель, который видит картину со стороны. Каждая идея: суть + почему это рычаг к цели.\n"
+        "Затем самые сильные 1-2 идеи сохрани через add_idea (подходящая category).\n\n"
+        "🔥 Заверши одной фразой — главное на завтра.\n"
+        "Тон живой и уверенный, без канцелярита. Не льсти, говори по делу.",
+        save_history=False
+    )
+    now = datetime.now(TZ)
+    db_save_message(user_id, "assistant",
+        f"[Система] Отправил вечернюю сводку в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
+    return result
+
+
+async def generate_idea_review(user_id: int) -> str:
+    """Недельный обзор банка идей — выбрать самые перспективные."""
+    result = await process_with_gemini(
+        user_id,
+        "Сделай недельный обзор банка идей. Вызови list_ideas (status new). "
+        "Сгруппируй по категориям, посчитай сколько накопилось, и выбери 3 самые перспективные "
+        f"с точки зрения движения к цели {BIG_GOAL}. По каждой — почему именно она. "
+        "Самые сильные пометь через update_idea (status=promising). Коротко и по делу.",
+        save_history=False
+    )
+    now = datetime.now(TZ)
+    db_save_message(user_id, "assistant",
+        f"[Система] Отправил обзор идей в {now.strftime('%H:%M')} {now.strftime('%d.%m.%Y')}")
     return result
 
 
@@ -1270,6 +1837,36 @@ async def scheduler_loop(bot: Bot):
                 except Exception as e:
                     logger.error(f"Check-in error: {e}")
 
+        # Вечерняя стратегическая сводка: итог дня + амбициозные идеи на завтра
+        if AUTO_EVENING_ENABLED:
+            ev_h, ev_m = map(int, AUTO_EVENING_TIME.split(":"))
+            ev_mins = ev_h * 60 + ev_m
+            if abs(now_mins - ev_mins) <= 1 and not db_was_posted("evening", today_key):
+                try:
+                    db_mark_posted("evening", today_key)
+                    text = await generate_evening_report(ALLOWED_USER_ID)
+                    if text:
+                        await send_html(bot, text, chat_id=ALLOWED_USER_ID)
+                    logger.info(f"Evening report sent: {today_key}")
+                except Exception as e:
+                    logger.error(f"Evening report error: {e}")
+
+            # Недельный обзор идей — воскресенье
+            iso = now.isocalendar()
+            idea_week_key = f"{iso[0]}-W{iso[1]:02d}"
+            ir_h, ir_m = map(int, AUTO_IDEAREVIEW_TIME.split(":"))
+            ir_mins = ir_h * 60 + ir_m
+            if (now.weekday() == 6 and abs(now_mins - ir_mins) <= 1
+                    and not db_was_posted("idea_review", idea_week_key)):
+                try:
+                    db_mark_posted("idea_review", idea_week_key)
+                    text = await generate_idea_review(ALLOWED_USER_ID)
+                    if text:
+                        await send_html(bot, text, chat_id=ALLOWED_USER_ID)
+                    logger.info(f"Idea review sent: {idea_week_key}")
+                except Exception as e:
+                    logger.error(f"Idea review error: {e}")
+
         await asyncio.sleep(45)  # 45 сек — баланс между точностью и нагрузкой на Calendar API
 
 
@@ -1309,11 +1906,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        f"Глеб, привет! 👋 Это Семён v{VERSION} — на связи, готов к работе!\n\n"
-        "Просто пиши или говори голосом — что нужно сделать, какие мысли крутятся, "
-        "что запланировать. Разберу, структурирую, не дам забыть.\n\n"
-        "Буду напоминать за 30 и 15 минут до каждой встречи 🔔\n\n"
-        "Что сейчас на радаре?"
+        f"Глеб, привет. Это Семён v{VERSION} — на связи.\n\n"
+        "Пиши или говори голосом — разберу на задачи, события, идеи и ожидания, не дам забыть.\n\n"
+        "Теперь я не просто планировщик, а ассистент-операционник: держу в голове цели, "
+        "узкое место, деньги (раздел «Экономика») и каждый вечер думаю как стратег — "
+        f"как нам выйти на {BIG_GOAL}.\n\n"
+        "Команды: /focus /goals /bottleneck /projects /ideas /waiting /strategy /evening\n"
+        "Напоминаю за 30 и 15 минут до встреч. Что на радаре?"
     )
 
 
@@ -1371,6 +1970,55 @@ async def cmd_debug_cal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     result = calendar_debug()
     await update.message.reply_text(result)
+
+
+async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вечерняя стратегическая сводка по запросу."""
+    if not is_allowed(update.effective_user.id):
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    text = await generate_evening_report(update.effective_user.id)
+    await send_html(None, text, reply_to=update.message)
+
+
+async def cmd_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = " ".join(context.args) if context.args else ""
+    if arg:
+        await send_reply(update, context, f"Задай фокус дня (set_goal scope=day_focus): {arg}")
+    else:
+        await send_reply(update, context, "Покажи фокус дня, цели недели и месяца (list_goals).")
+
+
+async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_reply(update, context, "Покажи все активные цели и фокус (list_goals).")
+
+
+async def cmd_bottleneck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_reply(update, context,
+        "Что сейчас сильнее всего ограничивает рост бизнеса? Проанализируй KPI и задачи, "
+        "определи одно главное узкое место и зафиксируй (set_goal scope=bottleneck).")
+
+
+async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_reply(update, context,
+        "Покажи проекты с рейтингом рычага (list_projects) и скажи, какой даёт наибольший рычаг сейчас.")
+
+
+async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_reply(update, context, "Покажи банк идей (list_ideas), сгруппируй по категориям.")
+
+
+async def cmd_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_reply(update, context, "Покажи, что мы ждём от других (list_waiting), отметь просроченное.")
+
+
+async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Стратегический разбор: как выйти на новый уровень к большой цели."""
+    await send_reply(update, context,
+        f"Включи режим опытного предпринимателя-стратега. Цель — {BIG_GOAL}. "
+        "Вызови get_business_kpi, list_projects, list_goals. Посмотри на бизнес со стороны: "
+        "где главный рычаг, что узкое место, какие 3 смелые амбициозные идеи реально выведут на новый уровень. "
+        "По каждой — суть и почему это рычаг. Самые сильные сохрани через add_idea.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1452,6 +2100,14 @@ def main():
     app.add_handler(CommandHandler("post",      cmd_post))
     app.add_handler(CommandHandler("postweek",  cmd_postweek))
     app.add_handler(CommandHandler("debug_cal", cmd_debug_cal))
+    app.add_handler(CommandHandler("evening",    cmd_evening))
+    app.add_handler(CommandHandler("focus",      cmd_focus))
+    app.add_handler(CommandHandler("goals",      cmd_goals))
+    app.add_handler(CommandHandler("bottleneck", cmd_bottleneck))
+    app.add_handler(CommandHandler("projects",   cmd_projects))
+    app.add_handler(CommandHandler("ideas",      cmd_ideas))
+    app.add_handler(CommandHandler("waiting",     cmd_waiting))
+    app.add_handler(CommandHandler("strategy",   cmd_strategy))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
