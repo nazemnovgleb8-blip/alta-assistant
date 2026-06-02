@@ -60,14 +60,17 @@ AUTO_MORNING_TIME  = os.getenv("AUTO_MORNING_TIME", "09:00")
 AUTO_WEEKLY_DAY    = os.getenv("AUTO_WEEKLY_DAY", "monday")
 AUTO_WEEKLY_TIME   = os.getenv("AUTO_WEEKLY_TIME", "08:30")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-# Каскад моделей: при лимите (429) автоматически падаем на следующую.
-# Можно переопределить через GEMINI_MODELS="model1,model2,..."
-_models_env = [m.strip() for m in os.getenv("GEMINI_MODELS", "").split(",") if m.strip()]
-GEMINI_MODELS = _models_env or [GEMINI_MODEL, "gemini-3.1-flash-lite", "gemini-2.5-flash"]
-# дедуп с сохранением порядка
-GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))
-VERSION = "6.4"
+# Каскад моделей: при лимите (429) или недоступности модели — падаем на следующую.
+# Источник — GEMINI_MODELS или GEMINI_MODEL; в любой можно через запятую: "modelA,modelB".
+# Запятые разбиваем всегда, чтобы список случайно не уехал в одно «имя модели».
+_raw_models = os.getenv("GEMINI_MODELS") or os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+GEMINI_MODELS = [m.strip() for m in _raw_models.split(",") if m.strip()]
+# Гарантируем фолбэк на lite (у неё выше бесплатный лимит)
+if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
+    GEMINI_MODELS.append("gemini-3.1-flash-lite")
+GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
+GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
+VERSION = "6.5"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
