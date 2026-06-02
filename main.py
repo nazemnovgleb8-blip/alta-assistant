@@ -61,7 +61,7 @@ AUTO_WEEKLY_DAY    = os.getenv("AUTO_WEEKLY_DAY", "monday")
 AUTO_WEEKLY_TIME   = os.getenv("AUTO_WEEKLY_TIME", "08:30")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-VERSION = "6.2"
+VERSION = "6.3"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -90,12 +90,23 @@ logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Восстанавливаем token.pickle из base64 (для Railway)
+# Восстанавливаем token.pickle из base64 (для Railway).
+# Пишем, если файла нет ИЛИ его содержимое отличается от base64 — чтобы новый токен
+# всегда побеждал старый (в т.ч. если token.pickle лежит на персистентном волюме).
 _token_b64 = os.getenv("GOOGLE_TOKEN_BASE64")
-if _token_b64 and not os.path.exists(GOOGLE_TOKEN_FILE):
-    with open(GOOGLE_TOKEN_FILE, "wb") as _f:
-        _f.write(base64.b64decode(_token_b64))
-    logger.info("token.pickle восстановлен из GOOGLE_TOKEN_BASE64")
+if _token_b64:
+    try:
+        _decoded = base64.b64decode(_token_b64)
+        _existing = None
+        if os.path.exists(GOOGLE_TOKEN_FILE):
+            with open(GOOGLE_TOKEN_FILE, "rb") as _f:
+                _existing = _f.read()
+        if _existing != _decoded:
+            with open(GOOGLE_TOKEN_FILE, "wb") as _f:
+                _f.write(_decoded)
+            logger.info("token.pickle обновлён из GOOGLE_TOKEN_BASE64 ✓")
+    except Exception as _e:
+        logger.error(f"Не удалось восстановить token.pickle из base64: {_e}")
 
 
 # ─── Фильтр AI-напоминаний ────────────────────────────────────────────────────
@@ -1585,6 +1596,16 @@ def make_system_prompt():
 Кто кому что должен прислать/ответить. Фиксируй через add_waiting, закрывай через resolve_waiting.
 Если срок прошёл — напомни прямо: «Павел всё ещё ждёт КП» / «Рома не прислал варианты с понедельника».
 
+━━━ ДЕЙСТВУЙ СРАЗУ — ЖЕЛЕЗНОЕ ПРАВИЛО №1 ━━━
+Если Глеб просит что-то добавить / создать / перенести / удалить — ВЫЗОВИ нужный инструмент
+ПРЯМО СЕЙЧАС, в этом же ответе, ДО того как написать ответ. Дождись результата инструмента.
+🚫 НИКОГДА не пиши «сейчас сделаю», «сейчас добавлю», «давай добавлю», «исправлю» — и не вызвать инструмент.
+   Это ложь: у тебя нет отложенных действий, «потом» не существует. Либо делаешь сразу, либо не обещаешь.
+✅ Сообщай ТОЛЬКО то, что реально выполнено — то есть инструмент вернул ok:true.
+   Если add_calendar_event вернул ok:true — «Добавил». Если ok:false — честно «не получилось, причина …».
+Пример НЕПРАВИЛЬНО: «Сейчас добавлю созвон с Рузаной 5 июня в 16:00.» (и не вызвал инструмент)
+Пример ПРАВИЛЬНО: [вызов add_calendar_event] → затем «Готово, созвон с Рузаной 5 июня в 16:00 в календаре.»
+
 ━━━ ЗАДАЧА vs СОБЫТИЕ — ЖЕЛЕЗНОЕ ПРАВИЛО ━━━
 📅 СОБЫТИЕ = Глеб явно назвал время ("встреча в 15:00", "созвон завтра в 11:30")
    → add_calendar_event. Только одно действие.
@@ -1619,6 +1640,7 @@ def make_system_prompt():
 🚫 НЕ добавляй в конце сообщений фразы типа "кстати, через X минут у тебя Y" — даже если видишь это в данных календаря. Напоминания о времени рассылает только автопланировщик.
 🚫 НЕ называй прошедшее событие предстоящим.
 🚫 НЕ придумывай встречи/события/дедлайны которых нет в данных API.
+🚫 НЕ обещай действие в будущем («сейчас добавлю», «исправлю», «сделаю») без немедленного вызова инструмента. Делай сразу.
 ✅ Показывай события и время — только когда Глеб сам спрашивает ("что сегодня?", "план дня", "сколько до встречи?").
 
 ━━━ РАЗБОР СУЩНОСТЕЙ — что куда ━━━
