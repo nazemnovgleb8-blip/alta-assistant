@@ -15,6 +15,9 @@ import asyncio
 import base64
 import tempfile
 import io
+import time
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -61,6 +64,12 @@ AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
 
 # Путь к БД — берём из переменной, чтобы Railway Volume можно было подключить
 DB_PATH = os.getenv("DB_PATH", "tasks.db")
+
+# Финансовый контур — KPI из task-board (раздел «Экономика»)
+# FINANCE_API_URL   = https://<task-board>.up.railway.app/api/kpi
+# FINANCE_API_TOKEN = совпадает с SEMYON_TOKEN в task-board
+FINANCE_API_URL   = os.getenv("FINANCE_API_URL", "")
+FINANCE_API_TOKEN = os.getenv("FINANCE_API_TOKEN", "")
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -514,6 +523,39 @@ def calendar_debug() -> str:
 
 
 # ─── Tool execution ───────────────────────────────────────────────────────────
+# ─── Финансовый контур: KPI из task-board ───────────────────────────────────────
+_KPI_CACHE = {"data": None, "ts": 0.0}
+
+def fetch_business_kpi(force: bool = False) -> dict:
+    """
+    Тянет бизнес-метрики из task-board (GET /api/kpi).
+    Те же цифры, что видит Лариса. Кэш 5 минут, чтобы не дёргать API на каждом запросе.
+    """
+    if not FINANCE_API_URL or not FINANCE_API_TOKEN:
+        return {"ok": False, "error": "Финансовый контур не настроен"}
+    now = time.time()
+    if not force and _KPI_CACHE["data"] and (now - _KPI_CACHE["ts"] < 300):
+        return _KPI_CACHE["data"]
+    try:
+        req = urllib.request.Request(
+            FINANCE_API_URL,
+            headers={"Authorization": f"Bearer {FINANCE_API_TOKEN}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        result = {"ok": True, **data}
+        _KPI_CACHE["data"] = result
+        _KPI_CACHE["ts"]   = now
+        logger.info("KPI обновлены из финансовой системы ✓")
+        return result
+    except urllib.error.HTTPError as e:
+        logger.warning(f"fetch_business_kpi HTTP {e.code}")
+        return {"ok": False, "error": f"HTTP {e.code}"}
+    except Exception as e:
+        logger.warning(f"fetch_business_kpi: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 def execute_tool(name: str, inp: dict) -> dict:
     inp = dict(inp)  # копируем чтобы не мутировать оригинал
     now = datetime.now(TZ)
@@ -706,6 +748,9 @@ def execute_tool(name: str, inp: dict) -> dict:
         ok, err = gtasks_delete(inp["task_id"])
         return {"ok": ok, "error": err}
 
+    elif name == "get_business_kpi":
+        return fetch_business_kpi(force=inp.get("force", False))
+
     return {"error": f"Неизвестный инструмент: {name}"}
 
 
@@ -800,6 +845,15 @@ GEMINI_FUNCTIONS = [
      "parameters": {"type": "object", "required": ["task_id"], "properties": {
          "task_id": {"type": "string", "description": "ID задачи из list_google_tasks"},
      }}},
+    {"name": "get_business_kpi",
+     "description": "Получить бизнес-метрики ALTA из финансовой системы (раздел «Экономика»): "
+                    "поступления за месяц/год, суммы подписанных договоров, дебиторку (всю и просроченную), "
+                    "потенциал пресейл-воронки, количество лидов, КП на выставлении, назначенные встречи, расходы за месяц. "
+                    "Вызывай когда Глеб спрашивает про деньги, продажи, выручку, кассу, лиды, долги клиентов — "
+                    "или когда нужно понять, что реально двигает бизнес и где узкое место.",
+     "parameters": {"type": "object", "properties": {
+         "force": {"type": "boolean", "description": "Принудительно обновить, минуя кэш (по умолчанию false)"},
+     }}},
 ]
 
 GEMINI_TOOL = gtypes.Tool(
@@ -828,6 +882,23 @@ def make_system_prompt():
     else:
         tasks_block = "  (нет активных задач)"
 
+    # Бизнес-метрики из финансовой системы (раздел «Экономика»)
+    def _money(n):
+        try:
+            return f"{int(n):,}".replace(",", " ")
+        except Exception:
+            return str(n)
+    kpi = fetch_business_kpi()
+    if kpi.get("ok"):
+        kpi_block = (
+            f"Поступило за месяц: {_money(kpi.get('received_this_month', 0))} ₽  |  за год: {_money(kpi.get('received_this_year', 0))} ₽\n"
+            f"Дебиторка: {_money(kpi.get('receivables_total', 0))} ₽ (просрочено {_money(kpi.get('receivables_overdue', 0))} ₽)\n"
+            f"Пресейл: {kpi.get('presale_leads', 0)} лидов, КП на выставлении: {kpi.get('kp_outstanding', 0)}, встреч назначено: {kpi.get('meetings_scheduled', 0)}\n"
+            f"Расходы за месяц: {_money(kpi.get('expenses_this_month', 0))} ₽"
+        )
+    else:
+        kpi_block = "  (финансовые данные сейчас недоступны)"
+
     return f"""Ты — Семён, личный бизнес-ассистент Глеба. Умный, энергичный, дружелюбный.
 
 ━━━ ХАРАКТЕР ━━━
@@ -847,6 +918,13 @@ def make_system_prompt():
 {tasks_block}
 
 Перед добавлением задачи — проверь список выше. Если задача с таким смыслом уже есть → НЕ добавляй дубль, скажи что уже есть (#ID).
+
+━━━ БИЗНЕС-МЕТРИКИ ALTA (раздел «Экономика») ━━━
+{kpi_block}
+
+Это живые цифры из финансовой системы. Используй их, когда речь о деньгах, продажах, кассе, лидах или долгах.
+Когда Глеб распыляется на операционку — напоминай, что реально двигает бизнес (продажи, лиды, дебиторка).
+За свежими/детальными данными вызывай get_business_kpi. Цифры не выдумывай — бери только отсюда или из инструмента.
 
 ━━━ ЗАДАЧА vs СОБЫТИЕ — ЖЕЛЕЗНОЕ ПРАВИЛО ━━━
 📅 СОБЫТИЕ = Глеб явно назвал время ("встреча в 15:00", "созвон завтра в 11:30")
