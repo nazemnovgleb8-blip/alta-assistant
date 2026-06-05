@@ -41,6 +41,14 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
+# Сотрудники с ОГРАНИЧЕННЫМ доступом: только свободные слоты + запись встречи.
+# ASSISTANT_USER_IDS="123456789,987654321"
+ASSISTANT_USER_IDS = {int(x) for x in os.getenv("ASSISTANT_USER_IDS", "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()}
+# Рабочие часы и длительность слота для записи сотрудником
+WORK_START   = os.getenv("WORK_START", "10:00")
+WORK_END     = os.getenv("WORK_END", "19:00")
+SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
+
 GROUP_ID           = int(os.getenv("GROUP_ID", "0"))
 THREAD_DAY         = int(os.getenv("THREAD_DAY", "9"))
 THREAD_WEEK        = int(os.getenv("THREAD_WEEK", "7"))
@@ -70,7 +78,7 @@ if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-3.1-flash-lite")
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
 GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
-VERSION = "7.0"
+VERSION = "7.1"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -98,6 +106,9 @@ logger = logging.getLogger(__name__)
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Ссылка на bot для фоновых уведомлений (напр. владельцу о записи сотрудником)
+_APP_BOT = None
 
 # Восстанавливаем token.pickle из base64 (для Railway).
 # Пишем, если файла нет ИЛИ его содержимое отличается от base64 — чтобы новый токен
@@ -854,6 +865,51 @@ def calendar_update_event(event_id, title=None, start_dt=None, end_dt=None, desc
         return False, str(e)
 
 
+def calendar_free_slots(date_str: str, duration_min: int = None):
+    """Свободные слоты на день в рабочие часы (без раскрытия названий чужих встреч)."""
+    duration = duration_min or SLOT_MINUTES
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return {"error": "неверная дата, нужен формат YYYY-MM-DD"}
+    ws_h, ws_m = map(int, WORK_START.split(":"))
+    we_h, we_m = map(int, WORK_END.split(":"))
+    day_start = d.replace(hour=ws_h, minute=ws_m, second=0, microsecond=0)
+    day_end   = d.replace(hour=we_h, minute=we_m, second=0, microsecond=0)
+
+    # Сегодня не предлагаем уже прошедшее время
+    now = datetime.now(TZ).replace(tzinfo=None)
+    cursor = day_start
+    if d.date() == now.date() and now > day_start:
+        minutes = ((now.hour * 60 + now.minute + 29) // 30) * 30  # округление вверх до 30 мин
+        cursor = d.replace(hour=0, minute=0) + timedelta(minutes=minutes)
+        if cursor < day_start:
+            cursor = day_start
+
+    events, err = calendar_list_events(day_start - timedelta(hours=1),
+                                       day_end + timedelta(hours=1), max_results=50)
+    if err:
+        return {"error": err}
+    from dateutil.parser import parse as dtparse
+    busy = []
+    for e in events:
+        s = e["start"].get("dateTime"); en = e["end"].get("dateTime")
+        if not s or not en:
+            continue  # all-day события не блокируют слоты
+        busy.append((dtparse(s).replace(tzinfo=None), dtparse(en).replace(tzinfo=None)))
+
+    slots = []
+    step = timedelta(minutes=30)
+    dur = timedelta(minutes=duration)
+    t = cursor
+    while t + dur <= day_end:
+        if all(not (t < be and t + dur > bs) for bs, be in busy):
+            slots.append(t.strftime("%H:%M"))
+        t += step
+    return {"date": date_str, "duration_min": duration,
+            "work_hours": f"{WORK_START}–{WORK_END}", "free_slots": slots}
+
+
 # ─── Google Tasks ─────────────────────────────────────────────────────────────
 def get_tasks_service():
     try:
@@ -1116,6 +1172,9 @@ def execute_tool(name: str, inp: dict) -> dict:
             for e in events
         ], "count": len(events)}
 
+    elif name == "find_free_slots":
+        return calendar_free_slots(inp["date"], inp.get("duration_min"))
+
     elif name == "delete_calendar_event":
         ok, err = calendar_delete_event(inp["event_id"])
         return {"ok": ok, "error": err}
@@ -1360,6 +1419,13 @@ GEMINI_FUNCTIONS = [
          "end_datetime":   {"type": "string", "description": "YYYY-MM-DD HH:MM"},
          "description":    {"type": "string"},
      }}},
+    {"name": "find_free_slots",
+     "description": "Показать свободные слоты в календаре на конкретный день в рабочие часы. "
+                    "Дату передавай как YYYY-MM-DD (вычисли из 'пятница'/'завтра'/'5 июня' сам).",
+     "parameters": {"type": "object", "required": ["date"], "properties": {
+         "date": {"type": "string", "description": "YYYY-MM-DD"},
+         "duration_min": {"type": "integer", "description": "Длительность встречи в минутах (по умолчанию 60)"},
+     }}},
     {"name": "get_daily_summary",
      "description": "Полная сводка на конкретный день: задачи + события из календаря. Всегда передавай дату явно.",
      "parameters": {"type": "object", "required": ["date"], "properties": {
@@ -1519,6 +1585,39 @@ GEMINI_FUNCTIONS = [
 GEMINI_TOOL = gtypes.Tool(
     function_declarations=[gtypes.FunctionDeclaration(**f) for f in GEMINI_FUNCTIONS]
 )
+
+# Ограниченный набор инструментов для роли «сотрудник»: только слоты + запись встречи.
+_ASSISTANT_TOOL_NAMES = {"find_free_slots", "add_calendar_event"}
+ASSISTANT_TOOL = gtypes.Tool(
+    function_declarations=[gtypes.FunctionDeclaration(**f)
+                           for f in GEMINI_FUNCTIONS if f["name"] in _ASSISTANT_TOOL_NAMES]
+)
+
+
+def make_assistant_prompt():
+    now = datetime.now(TZ)
+    today = now.date()
+    day_names = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+    return f"""Ты — Семён, ассистент по записи встреч в календарь Глеба. Общаешься с сотрудником.
+
+Сейчас: {now.strftime('%H:%M')} МСК | {day_names[today.weekday()]} {now.strftime('%d.%m.%Y')}. Сегодня: {today}.
+Рабочие часы для записи: {WORK_START}–{WORK_END}. Длительность встречи по умолчанию — {SLOT_MINUTES} мин.
+
+ТЫ УМЕЕШЬ РОВНО ДВЕ ВЕЩИ:
+1) Показать свободные слоты — вызови find_free_slots(date, duration_min). Дату вычисли сам
+   («пятница», «завтра», «5 июня» → YYYY-MM-DD). Покажи список свободного времени аккуратно.
+2) Поставить встречу/консультацию — вызови add_calendar_event(title, start_datetime "YYYY-MM-DD HH:MM").
+   Название бери из запроса (например «Консультация — Иван»). Если имени нет — спроси коротко.
+
+🚫 СТРОГО ЗАПРЕЩЕНО раскрывать любую информацию Глеба: задачи, дела, финансы, доходы, планы, цели,
+   клиентов, названия его встреч. Ты этого НЕ знаешь и не обсуждаешь. Показывай только СВОБОДНОЕ время.
+Если просят что-то кроме «показать свободные слоты» и «записать встречу» — вежливо откажи:
+«Я могу только показать свободное время и записать встречу».
+
+Тон: вежливый, деловой, короткий. Обращайся на «вы».
+Действуй сразу: просят записать — вызывай инструмент в этом же ответе, без «сейчас сделаю».
+Когда записал (add_calendar_event вернул ok) — подтверди: что и на какое время поставлено.
+Без markdown-заголовков, без звёздочек как маркеров — обычный текст, маркер «•»."""
 
 
 # ─── System Prompt ────────────────────────────────────────────────────────────
@@ -1690,11 +1789,12 @@ def make_system_prompt():
 3. "Сегодня" / "план дня" → get_daily_summary с датой {today}
 4. "Завтра" → get_daily_summary с датой {tomorrow}
 5. "Неделя" → get_weekly_summary
-6. Удалить задачу → list_google_tasks → delete_google_task по id
-7. Удалить событие → get_calendar_events → delete_calendar_event по id
-8. Перенести событие → get_calendar_events → update_calendar_event
-9. Голосовые автотранскрибируются — отвечай на суть.
-10. get_calendar_events — только если Глеб явно просит показать календарь.
+6. Отметить задачу выполненной → СНАЧАЛА list_google_tasks (взять реальный id), потом complete_google_task по этому id. Никогда не выдумывай id.
+7. Удалить задачу → list_google_tasks → delete_google_task по id
+8. Удалить событие → get_calendar_events → delete_calendar_event по id
+9. Перенести событие → get_calendar_events → update_calendar_event
+10. Голосовые автотранскрибируются — отвечай на суть.
+11. get_calendar_events — только если Глеб явно просит показать календарь.
 
 ━━━ ЗАПРЕТЫ ━━━
 🚫 НЕ добавляй в конце сообщений фразы типа "кстати, через X минут у тебя Y" — даже если видишь это в данных календаря. Напоминания о времени рассылает только автопланировщик.
@@ -1784,19 +1884,19 @@ async def _gemini_generate(contents, config):
     raise last_err if last_err else RuntimeError("Нет доступных моделей")
 
 
-async def process_with_gemini(conv, user_message: str, save_history: bool = True) -> str:
+async def process_with_gemini(conv, user_message: str, save_history: bool = True, role: str = "owner") -> str:
     """
     conv — ключ изоляции диалога (личка / конкретная ветка-тема).
-    save_history=False используется для автопостинга —
-    чтобы системные запросы не засоряли историю диалога.
+    role: "owner" — полный доступ; "assistant" — только слоты + запись встречи.
+    save_history=False используется для автопостинга.
     """
     conv = str(conv)
     history = db_get_history(conv, limit=20) if save_history else []
-    logger.info(f"Семён: models={GEMINI_MODELS}, conv={conv}, history={len(history)}, save={save_history}")
+    logger.info(f"Семён[{role}]: models={GEMINI_MODELS}, conv={conv}, history={len(history)}, save={save_history}")
 
     contents = []
-    for role, content in history:
-        gemini_role = "user" if role == "user" else "model"
+    for h_role, content in history:
+        gemini_role = "user" if h_role == "user" else "model"
         contents.append(gtypes.Content(
             role=gemini_role,
             parts=[gtypes.Part.from_text(text=content)]
@@ -1806,11 +1906,19 @@ async def process_with_gemini(conv, user_message: str, save_history: bool = True
         parts=[gtypes.Part.from_text(text=user_message)]
     ))
 
-    config = gtypes.GenerateContentConfig(
-        system_instruction=make_system_prompt(),
-        tools=[GEMINI_TOOL],
-    )
+    # Роль определяет и промпт, и набор инструментов
+    if role == "assistant":
+        config = gtypes.GenerateContentConfig(
+            system_instruction=make_assistant_prompt(),
+            tools=[ASSISTANT_TOOL],
+        )
+    else:
+        config = gtypes.GenerateContentConfig(
+            system_instruction=make_system_prompt(),
+            tools=[GEMINI_TOOL],
+        )
 
+    booked_events = []  # для уведомления владельца, когда записывает сотрудник
     for iteration in range(15):
         try:
             response, used_model = await _gemini_generate(contents, config)
@@ -1832,6 +1940,8 @@ async def process_with_gemini(conv, user_message: str, save_history: bool = True
                 inp = dict(fc.args) if fc.args else {}
                 result = execute_tool(fc.name, inp)
                 logger.info(f"Tool [{fc.name}] → {str(result)[:120]}")
+                if role == "assistant" and fc.name == "add_calendar_event" and result.get("ok"):
+                    booked_events.append({"title": inp.get("title"), "start": inp.get("start_datetime")})
                 tool_result_parts.append(
                     gtypes.Part.from_function_response(name=fc.name, response=result)
                 )
@@ -1851,6 +1961,16 @@ async def process_with_gemini(conv, user_message: str, save_history: bool = True
             if save_history and final_text:
                 db_save_message(conv, "user", user_message)
                 db_save_message(conv, "assistant", final_text)
+            # Уведомляем владельца, если сотрудник поставил встречу
+            if booked_events and _APP_BOT is not None and ALLOWED_USER_ID:
+                for b in booked_events:
+                    try:
+                        await _APP_BOT.send_message(
+                            chat_id=ALLOWED_USER_ID,
+                            text=f"📅 Сотрудник записал встречу: {b['title']} — {b['start']}"
+                        )
+                    except Exception as _e:
+                        logger.error(f"owner notify error: {_e}")
             return final_text or "Готово."
 
     return "Семён завис — попробуй ещё раз."
@@ -2133,8 +2253,19 @@ async def scheduler_loop(bot: Bot):
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+def user_role(user_id: int) -> str | None:
+    """owner — полный доступ; assistant — только слоты+запись; None — нет доступа."""
+    if ALLOWED_USER_ID == 0 or user_id == ALLOWED_USER_ID:
+        return "owner"
+    if user_id in ASSISTANT_USER_IDS:
+        return "assistant"
+    return None
+
 def is_allowed(user_id: int) -> bool:
-    return ALLOWED_USER_ID == 0 or user_id == ALLOWED_USER_ID
+    return user_role(user_id) is not None
+
+def is_owner(user_id: int) -> bool:
+    return user_role(user_id) == "owner"
 
 
 def get_thread_context(update: Update) -> str | None:
@@ -2149,13 +2280,14 @@ def get_thread_context(update: Update) -> str | None:
 
 # ─── Telegram Handlers ────────────────────────────────────────────────────────
 async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    if not is_allowed(update.effective_user.id):
+    role = user_role(update.effective_user.id)
+    if role is None:
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         thread_id = update.message.message_thread_id if update.message else None
         conv = conv_key(update.effective_chat.id, thread_id)
-        text = await process_with_gemini(conv, prompt)
+        text = await process_with_gemini(conv, prompt, role=role)
         await send_html(None, text, reply_to=update.message, thread_id=thread_id)
     except Exception as e:
         logger.error(f"send_reply error: {e}", exc_info=True)
@@ -2166,7 +2298,16 @@ async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    role = user_role(update.effective_user.id)
+    if role is None:
+        return
+    if role == "assistant":
+        await update.message.reply_text(
+            "Здравствуйте! Я помогу записать встречу в календарь.\n\n"
+            "Напишите, например: «Какие слоты свободны в пятницу?» — покажу свободное время.\n"
+            "Затем выберите время и скажите: «Поставь консультацию с Иваном в 15:00» — запишу.\n\n"
+            f"Рабочие часы: {WORK_START}–{WORK_END}."
+        )
         return
     await update.message.reply_text(
         f"Глеб, привет. Это Семён v{VERSION} — на связи.\n\n"
@@ -2204,7 +2345,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     thread_id = update.message.message_thread_id if update.message else None
     db_clear_history(conv_key(update.effective_chat.id, thread_id))
@@ -2212,7 +2353,7 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     await update.message.reply_text("📤 Генерирую план дня...")
     text = await generate_day_plan(update.effective_user.id)
@@ -2221,7 +2362,7 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_postweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     await update.message.reply_text("📤 Генерирую план недели...")
     text = await generate_week_plan(update.effective_user.id)
@@ -2230,7 +2371,7 @@ async def cmd_postweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_debug_cal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     result = calendar_debug()
     await update.message.reply_text(result)
@@ -2238,7 +2379,7 @@ async def cmd_debug_cal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вечерняя стратегическая сводка по запросу."""
-    if not is_allowed(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     text = await generate_evening_report(update.effective_user.id)
@@ -2287,7 +2428,7 @@ async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_dedup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Почистить дубли задач."""
-    if not is_allowed(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     res = execute_tool("dedup_tasks", {})
     await update.message.reply_text(
@@ -2352,6 +2493,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
+    global _APP_BOT
+    _APP_BOT = application.bot
     if AUTO_POST_ENABLED and GROUP_ID:
         asyncio.create_task(scheduler_loop(application.bot))
         logger.info("Scheduler started ✓")
