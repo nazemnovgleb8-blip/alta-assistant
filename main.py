@@ -78,7 +78,7 @@ if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-3.1-flash-lite")
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
 GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
-VERSION = "7.1"
+VERSION = "7.2"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -966,11 +966,14 @@ def gtasks_complete(task_id: str):
     if not service:
         return False, "Google Tasks не подключён"
     try:
-        task = service.tasks().get(tasklist="@default", taskId=task_id).execute()
+        # ВАЖНО: в Google Tasks API параметр называется task, а не taskId
+        task = service.tasks().get(tasklist="@default", task=task_id).execute()
         task["status"] = "completed"
-        service.tasks().update(tasklist="@default", taskId=task_id, body=task).execute()
+        task["completed"] = datetime.now(TZ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        service.tasks().update(tasklist="@default", task=task_id, body=task).execute()
         return True, None
     except Exception as e:
+        logger.error(f"gtasks_complete: {e}")
         return False, str(e)
 
 
@@ -979,7 +982,7 @@ def gtasks_delete(task_id: str):
     if not service:
         return False, "Google Tasks не подключён"
     try:
-        service.tasks().delete(tasklist="@default", taskId=task_id).execute()
+        service.tasks().delete(tasklist="@default", task=task_id).execute()
         logger.info(f"Google Task удалена: {task_id}")
         return True, None
     except Exception as e:
