@@ -78,7 +78,7 @@ if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-3.1-flash-lite")
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
 GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
-VERSION = "7.2"
+VERSION = "7.3"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -1868,9 +1868,15 @@ def _is_quota_error(e) -> bool:
     s = str(e)
     return "429" in s or "RESOURCE_EXHAUSTED" in s or "quota" in s.lower()
 
+def _is_transient_error(e) -> bool:
+    """Временные сбои модели — есть смысл попробовать другую модель / позже."""
+    s = str(e).lower()
+    return ("503" in s or "unavailable" in s or "high demand" in s or "overloaded" in s
+            or "500" in s or "internal error" in s or "deadline" in s or "timeout" in s)
+
 
 async def _gemini_generate(contents, config):
-    """Каскад моделей: при 429/исчерпании квоты пробуем следующую модель."""
+    """Каскад моделей: при лимите (429) или временном сбое (503) пробуем следующую модель."""
     last_err = None
     for mdl in GEMINI_MODELS:
         try:
@@ -1879,8 +1885,8 @@ async def _gemini_generate(contents, config):
             )
             return resp, mdl
         except Exception as e:
-            if _is_quota_error(e):
-                logger.warning(f"Модель {mdl} — лимит/квота, пробую следующую")
+            if _is_quota_error(e) or _is_transient_error(e):
+                logger.warning(f"Модель {mdl} недоступна ({str(e)[:60]}), пробую следующую")
                 last_err = e
                 continue
             raise
@@ -1930,6 +1936,9 @@ async def process_with_gemini(conv, user_message: str, save_history: bool = True
                 logger.error("Все модели исчерпали квоту")
                 return ("Уперся в лимит запросов к ИИ (бесплатная квота Google). "
                         "Попробуй через минуту 🙏")
+            if _is_transient_error(e):
+                logger.error(f"Все модели временно недоступны: {str(e)[:80]}")
+                return "ИИ сейчас перегружен на стороне Google. Попробуй ещё раз через минуту 🙏"
             raise
 
         candidate = response.candidates[0]
@@ -2039,6 +2048,7 @@ async def generate_day_plan(user_id: int) -> str:
         "💰 Деньги — что сегодня приближает к выручке/закрывает дебиторку\n"
         "👥 Кого пнуть / что ждём от других\n"
         "⚠️ Риск дня (если есть)\n"
+        "НЕ пересказывай весь план недели целиком — возьми из него только то, что важно на сегодня. "
         "Без воды, без прогресс-баров.",
         save_history=False
     )
@@ -2440,6 +2450,49 @@ async def cmd_dedup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _plan_text_from(update):
+    """Текст плана: после команды в том же сообщении, либо из сообщения-ответа."""
+    raw = update.message.text or ""
+    after = raw.partition(" ")[2].strip() if " " in raw else raw.partition("\n")[2].strip()
+    if not after and update.message.reply_to_message:
+        after = (update.message.reply_to_message.text or "").strip()
+    return after
+
+
+async def cmd_setweek(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    text = _plan_text_from(update)
+    if not text:
+        await update.message.reply_text(
+            "Пришли так: /setweek и сразу текст плана недели (можно с новой строки),\n"
+            "или ответь этой командой на сообщение с планом.")
+        return
+    db_set_plan("week", text)
+    await update.message.reply_text("✅ План недели обновлён — старый перезаписан. Теперь Семён опирается на него.")
+
+
+async def cmd_setmonth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    text = _plan_text_from(update)
+    if not text:
+        await update.message.reply_text("Пришли так: /setmonth и текст плана месяца (или ответом на сообщение).")
+        return
+    db_set_plan("month", text)
+    await update.message.reply_text("✅ План месяца обновлён.")
+
+
+async def cmd_showplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    w = db_get_plan("week"); mo = db_get_plan("month")
+    parts = []
+    parts.append("📋 ПЛАН НЕДЕЛИ:\n" + (f"{w[0]}\n(обновлён: {w[1]})" if w else "— не задан"))
+    parts.append("\n📅 ПЛАН МЕСЯЦА:\n" + (f"{mo[0]}\n(обновлён: {mo[1]})" if mo else "— не задан"))
+    await update.message.reply_text("\n".join(parts))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -2530,6 +2583,9 @@ def main():
     app.add_handler(CommandHandler("waiting",     cmd_waiting))
     app.add_handler(CommandHandler("strategy",   cmd_strategy))
     app.add_handler(CommandHandler("dedup",      cmd_dedup))
+    app.add_handler(CommandHandler("setweek",    cmd_setweek))
+    app.add_handler(CommandHandler("setmonth",   cmd_setmonth))
+    app.add_handler(CommandHandler("showplan",   cmd_showplan))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
