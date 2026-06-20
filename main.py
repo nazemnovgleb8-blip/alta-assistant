@@ -657,15 +657,15 @@ def db_biz_upsert(chat_id, conn_id, title, text, from_who, at_iso):
     if row and row[0]:
         try: recent = json.loads(row[0])
         except Exception: recent = []
-    recent.append({"from": from_who, "text": (text or "")[:300], "at": at_iso})
-    recent = recent[-8:]   # храним только последние 8 сообщений
+    recent.append({"from": from_who, "text": (text or "")[:1200], "at": at_iso})
+    recent = recent[-50:]   # храним последние 50 сообщений на чат (только текст, без медиа)
     c.execute(
         "INSERT INTO business_chats (chat_id,conn_id,title,last_text,last_from,last_at,recent,updated_at) "
         "VALUES (?,?,?,?,?,?,?,datetime('now')) "
         "ON CONFLICT(chat_id) DO UPDATE SET conn_id=excluded.conn_id, title=excluded.title, "
         "last_text=excluded.last_text, last_from=excluded.last_from, last_at=excluded.last_at, "
         "recent=excluded.recent, updated_at=datetime('now')",
-        (str(chat_id), conn_id, title, (text or "")[:300], from_who, at_iso, json.dumps(recent, ensure_ascii=False))
+        (str(chat_id), conn_id, title, (text or "")[:500], from_who, at_iso, json.dumps(recent, ensure_ascii=False))
     )
     conn.commit(); conn.close()
 
@@ -1432,10 +1432,15 @@ def execute_tool(name: str, inp: dict) -> dict:
         chats = db_biz_list(only_waiting=inp.get("only_waiting", False))
         if q:
             chats = [c for c in chats if q in (c.get("title") or "").lower()]
+        # если спрашивают про конкретного клиента (мало чатов) — даём полную переписку;
+        # если это общий список — короткое превью, чтобы не раздувать контекст
+        detail = len(chats) <= 3
+        per = 50 if detail else 8
+        limit = 12 if detail else 40
         out = []
-        for c in chats[:30]:
+        for c in chats[:limit]:
             out.append({"title": c["title"], "last_from": c["last_from"], "last_at": c["last_at"],
-                        "recent": [{"from": mm["from"], "text": mm["text"]} for mm in (c.get("recent") or [])[-6:]]})
+                        "recent": [{"from": mm["from"], "text": mm["text"]} for mm in (c.get("recent") or [])[-per:]]})
         return {"chats": out, "count": len(out)}
 
     elif name == "dedup_tasks":
