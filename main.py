@@ -83,7 +83,7 @@ if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-3.1-flash-lite")
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
 GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
-VERSION = "8.0"
+VERSION = "8.1"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -1876,12 +1876,13 @@ def make_system_prompt():
 Кто кому что должен прислать/ответить. Фиксируй через add_waiting, закрывай через resolve_waiting.
 Если срок прошёл — напомни прямо: «Павел всё ещё ждёт КП» / «Рома не прислал варианты с понедельника».
 
-━━━ КЛИЕНТСКИЕ ПЕРЕПИСКИ (Telegram, режим чтения) ━━━
-У тебя ЕСТЬ доступ к деловым/клиентским перепискам Глеба в Telegram — в режиме наблюдения (только чтение).
-Когда Глеб спрашивает про диалоги («что с клиентом X», «кто ждёт ответа», «о чём договорились», «кому я не ответил»,
-«что там по …») — вызывай read_client_chats и отвечай по реальным сообщениям. НЕ говори «я не читаю твои чаты» —
+━━━ ПЕРЕПИСКИ И ГРУППЫ (Telegram, режим чтения) ━━━
+У тебя ЕСТЬ доступ к перепискам Глеба в Telegram (наблюдение, только чтение): личные клиентские чаты (👥 без метки),
+а также группы (👥) и каналы (📢), куда добавлен бот.
+Когда Глеб спрашивает про диалоги («что с клиентом X», «кто ждёт ответа», «о чём договорились», «что обсуждали в группе Y»,
+«кому я не ответил», «что там по …») — вызывай read_client_chats и отвечай по реальным сообщениям. НЕ говори «я не читаю чаты» —
 доступ есть. Опирайся только на данные из инструмента, не выдумывай. Истории до момента подключения нет — это нормально.
-🚫 Ты НИКОГДА не пишешь клиентам сам и не предлагаешь это сделать за тебя — только наблюдаешь, отвечаешь Глебу и подсказываешь, кому/что написать.
+🚫 Ты НИКОГДА не пишешь в чаты/группы сам и не предлагаешь сделать это за тебя — только наблюдаешь, отвечаешь Глебу и подсказываешь, кому/что написать.
 
 ━━━ ДЕЙСТВУЙ СРАЗУ — ЖЕЛЕЗНОЕ ПРАВИЛО №1 ━━━
 Если Глеб просит что-то добавить / создать / перенести / удалить — ВЫЗОВИ нужный инструмент
@@ -2272,6 +2273,36 @@ async def on_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
                       datetime.now(TZ).isoformat())
     except Exception as e:
         logger.error(f"on_business_update: {e}")
+
+
+async def observe_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Наблюдение за группами/каналами, куда добавлен бот. ТОЛЬКО запись, Семён там не отвечает."""
+    if not BIZ_ENABLED:
+        return
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if not msg or not chat:
+            return
+        if chat.id == GROUP_ID:               # управляющую группу не трекаем
+            return
+        if chat.type not in ("group", "supergroup", "channel"):
+            return
+        text = msg.text or msg.caption or "[вложение]"
+        if chat.type == "channel":
+            from_who, who, mark = "client", (chat.title or "канал"), "📢 "
+            rec_text = text
+        else:
+            fu = msg.from_user
+            is_owner_msg = bool(fu and fu.id == ALLOWED_USER_ID)
+            from_who = "me" if is_owner_msg else "client"
+            who = (fu.full_name if fu else None) or "кто-то"
+            mark = "👥 "
+            rec_text = f"{who}: {text}"
+        title = mark + (chat.title or str(chat.id))
+        db_biz_upsert(chat.id, None, title, rec_text, from_who, datetime.now(TZ).isoformat())
+    except Exception as e:
+        logger.error(f"observe_chat: {e}")
 
 
 async def generate_biz_digest(user_id: int) -> str | None:
@@ -2702,6 +2733,11 @@ async def cmd_biz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
+    chat = update.effective_chat
+    # Отвечаем ТОЛЬКО в личке (владелец/сотрудник) и в управляющей группе.
+    # Чужие группы/каналы НЕ трогаем — их только наблюдаем (observe_chat), Семён там не пишет.
+    if chat and chat.type in ("group", "supergroup", "channel") and chat.id != GROUP_ID:
+        return
     user_id = update.effective_user.id
     if update.effective_chat.id == GROUP_ID and not is_allowed(user_id):
         return
@@ -2795,8 +2831,12 @@ def main():
     app.add_handler(CommandHandler("biz",        cmd_biz))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    # Telegram Business: наблюдение за клиентскими чатами (отдельная группа, только запись)
+    # Telegram Business: наблюдение за личными клиентскими чатами (только запись)
     app.add_handler(TypeHandler(Update, on_business_update), group=1)
+    # Наблюдение за группами/каналами, куда добавлен бот (только запись, без ответов)
+    app.add_handler(MessageHandler(
+        (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & ~filters.COMMAND,
+        observe_chat), group=2)
 
     logger.info(f"🤖 Семён v{VERSION} запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
