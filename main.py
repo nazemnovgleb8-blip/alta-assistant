@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 from telegram import Update, Bot
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, TypeHandler,
     filters, ContextTypes
 )
 from telegram.error import TelegramError
@@ -48,6 +48,11 @@ ASSISTANT_USER_IDS = {int(x) for x in os.getenv("ASSISTANT_USER_IDS", "").replac
 WORK_START   = os.getenv("WORK_START", "10:00")
 WORK_END     = os.getenv("WORK_END", "19:00")
 SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
+
+# Telegram Business: наблюдение за клиентскими перепиской (ТОЛЬКО чтение, бот клиентам НЕ пишет).
+BIZ_ENABLED     = os.getenv("BIZ_ENABLED", "true").lower() == "true"
+THREAD_BIZ      = int(os.getenv("THREAD_BIZ", "0"))      # ветка в группе для дайджеста переписок
+BIZ_DIGEST_TIME = os.getenv("BIZ_DIGEST_TIME", "20:30")  # время вечернего дайджеста по перепискам
 
 GROUP_ID           = int(os.getenv("GROUP_ID", "0"))
 THREAD_DAY         = int(os.getenv("THREAD_DAY", "9"))
@@ -78,7 +83,7 @@ if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-3.1-flash-lite")
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
 GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
-VERSION = "7.3"
+VERSION = "8.0"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -316,6 +321,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS plans (
             kind        TEXT PRIMARY KEY,
             text        TEXT NOT NULL,
+            updated_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Telegram Business: наблюдение за клиентскими чатами (только метаданные + последние сообщения)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS business_chats (
+            chat_id     TEXT PRIMARY KEY,
+            conn_id     TEXT,
+            title       TEXT,
+            last_text   TEXT,
+            last_from   TEXT,
+            last_at     TEXT,
+            recent      TEXT,
             updated_at  TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -627,6 +645,46 @@ def db_get_plan(kind):
     c.execute("SELECT text, updated_at FROM plans WHERE kind=?", (kind,))
     row = c.fetchone(); conn.close()
     return row  # (text, updated_at) | None
+
+
+# ── Telegram Business: клиентские переписки (только чтение/наблюдение) ──
+def db_biz_upsert(chat_id, conn_id, title, text, from_who, at_iso):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT recent FROM business_chats WHERE chat_id=?", (str(chat_id),))
+    row = c.fetchone()
+    recent = []
+    if row and row[0]:
+        try: recent = json.loads(row[0])
+        except Exception: recent = []
+    recent.append({"from": from_who, "text": (text or "")[:300], "at": at_iso})
+    recent = recent[-8:]   # храним только последние 8 сообщений
+    c.execute(
+        "INSERT INTO business_chats (chat_id,conn_id,title,last_text,last_from,last_at,recent,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,datetime('now')) "
+        "ON CONFLICT(chat_id) DO UPDATE SET conn_id=excluded.conn_id, title=excluded.title, "
+        "last_text=excluded.last_text, last_from=excluded.last_from, last_at=excluded.last_at, "
+        "recent=excluded.recent, updated_at=datetime('now')",
+        (str(chat_id), conn_id, title, (text or "")[:300], from_who, at_iso, json.dumps(recent, ensure_ascii=False))
+    )
+    conn.commit(); conn.close()
+
+def db_biz_list(only_waiting=False):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if only_waiting:
+        c.execute("SELECT chat_id,title,last_text,last_from,last_at,recent FROM business_chats WHERE last_from='client' ORDER BY last_at DESC")
+    else:
+        c.execute("SELECT chat_id,title,last_text,last_from,last_at,recent FROM business_chats ORDER BY last_at DESC")
+    rows = c.fetchall(); conn.close()
+    out = []
+    for r in rows:
+        recent = []
+        try: recent = json.loads(r[5]) if r[5] else []
+        except Exception: recent = []
+        out.append({"chat_id": r[0], "title": r[1], "last_text": r[2],
+                    "last_from": r[3], "last_at": r[4], "recent": recent})
+    return out
 
 
 def conv_key(chat_id, thread_id=None) -> str:
@@ -2157,6 +2215,55 @@ async def generate_idea_review(user_id: int) -> str:
     return result
 
 
+# ─── Telegram Business: наблюдение за клиентскими чатами (ТОЛЬКО ЧТЕНИЕ) ──────────
+# ВАЖНО: Семён НИКОГДА не пишет клиентам сам. Здесь только запись наблюдений в БД.
+async def on_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not BIZ_ENABLED:
+        return
+    try:
+        bc = getattr(update, "business_connection", None)
+        if bc is not None:
+            logger.info(f"Business connection {getattr(bc,'id','?')} enabled={getattr(bc,'is_enabled',None)}")
+            return
+        msg = getattr(update, "business_message", None) or getattr(update, "edited_business_message", None)
+        if msg is None:
+            return
+        chat = msg.chat
+        fu = msg.from_user
+        # в личных чатах: если отправитель == собеседник, значит писал КЛИЕНТ; иначе — владелец
+        from_who = 'client' if (fu and chat and fu.id == chat.id) else 'me'
+        title = (getattr(chat, "title", None)
+                 or " ".join(filter(None, [getattr(chat, "first_name", None), getattr(chat, "last_name", None)]))
+                 or (("@" + chat.username) if getattr(chat, "username", None) else str(chat.id)))
+        text = msg.text or msg.caption or "[вложение]"
+        db_biz_upsert(chat.id, getattr(msg, "business_connection_id", None), title, text, from_who,
+                      datetime.now(TZ).isoformat())
+    except Exception as e:
+        logger.error(f"on_business_update: {e}")
+
+
+async def generate_biz_digest(user_id: int) -> str | None:
+    """Дайджест по клиентским перепискам: кому ответить / что упустил. Только наблюдение, без отправки."""
+    waiting = db_biz_list(only_waiting=True)
+    if not waiting:
+        return None
+    lines = []
+    for w in waiting[:25]:
+        last3 = "; ".join(f"{m['from']}: {m['text']}" for m in (w.get("recent") or [])[-3:])
+        when = (w.get("last_at") or "")[:16].replace("T", " ")
+        lines.append(f"• {w['title']} (клиент написал последним, {when}): {last3}")
+    data = "\n".join(lines)
+    return await process_with_gemini(
+        conv_key(user_id),
+        "Это клиентские переписки, где ПОСЛЕДНИМ писал клиент, а ты ещё не ответил. "
+        "По контексту определи: кому реально важно ответить сегодня и кого нельзя терять, что ты упустил, "
+        "кому нужен следующий шаг или что скинуть. Опирайся ТОЛЬКО на эти данные, не выдумывай. "
+        "Коротко: по каждому — имя и что сделать. Живым тоном, без воды. Только текст, ничего не создавай.\n\n"
+        f"Переписки:\n{data}",
+        save_history=False
+    )
+
+
 # ─── Напоминалки ──────────────────────────────────────────────────────────────
 async def check_and_send_reminders(bot: Bot):
     try:
@@ -2302,6 +2409,20 @@ async def scheduler_loop(bot: Bot):
                     logger.info(f"Idea review sent: {idea_week_key}")
                 except Exception as e:
                     logger.error(f"Idea review error: {e}")
+
+        # Дайджест по клиентским перепискам (Telegram Business) — в отдельную ветку
+        if BIZ_ENABLED and THREAD_BIZ and GROUP_ID:
+            bz_h, bz_m = map(int, BIZ_DIGEST_TIME.split(":"))
+            bz_mins = bz_h * 60 + bz_m
+            if abs(now_mins - bz_mins) <= 1 and not db_was_posted("biz_digest", today_key):
+                try:
+                    db_mark_posted("biz_digest", today_key)
+                    text = await generate_biz_digest(ALLOWED_USER_ID)
+                    if text:
+                        await post_to_thread(bot, "🗂 Переписки — кому ответить и что упустил:\n\n" + text, THREAD_BIZ)
+                    logger.info(f"Biz digest sent: {today_key}")
+                except Exception as e:
+                    logger.error(f"Biz digest error: {e}")
 
         await asyncio.sleep(45)  # 45 сек — баланс между точностью и нагрузкой на Calendar API
 
@@ -2534,6 +2655,18 @@ async def cmd_showplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(parts))
 
 
+async def cmd_biz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Дайджест по клиентским перепискам (только владельцу)."""
+    if not is_owner(update.effective_user.id):
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    text = await generate_biz_digest(update.effective_user.id)
+    if not text:
+        await update.message.reply_text("Пока нет переписок, где клиент ждёт ответа (или Telegram Business ещё не подключён).")
+        return
+    await send_html(None, text, reply_to=update.message)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -2627,8 +2760,11 @@ def main():
     app.add_handler(CommandHandler("setweek",    cmd_setweek))
     app.add_handler(CommandHandler("setmonth",   cmd_setmonth))
     app.add_handler(CommandHandler("showplan",   cmd_showplan))
+    app.add_handler(CommandHandler("biz",        cmd_biz))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # Telegram Business: наблюдение за клиентскими чатами (отдельная группа, только запись)
+    app.add_handler(TypeHandler(Update, on_business_update), group=1)
 
     logger.info(f"🤖 Семён v{VERSION} запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
