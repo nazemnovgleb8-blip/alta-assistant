@@ -83,7 +83,7 @@ if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-3.1-flash-lite")
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
 GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
-VERSION = "8.1"
+VERSION = "8.2"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -2517,7 +2517,20 @@ def get_thread_context(update: Update) -> str | None:
 
 
 # ─── Telegram Handlers ────────────────────────────────────────────────────────
+def _can_reply_here(update: Update) -> bool:
+    """ЖЁСТКИЙ замок: Семён отвечает ТОЛЬКО в личке (владелец/сотрудник) и в управляющей группе.
+    В любых других группах/каналах он только наблюдает и НИКОГДА не пишет."""
+    chat = update.effective_chat
+    if chat is None:
+        return False
+    if chat.type == "private":
+        return user_role(update.effective_user.id) is not None
+    return chat.id == GROUP_ID   # только управляющая группа «alta трекинг»
+
+
 async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    if not _can_reply_here(update):
+        return
     role = user_role(update.effective_user.id)
     if role is None:
         return
@@ -2772,6 +2785,8 @@ async def transcribe_voice(file_bytes: bytes) -> str | None:
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.voice:
+        return
+    if not _can_reply_here(update):   # в чужих группах не отвечаем голосом
         return
     if not is_allowed(update.effective_user.id):
         return
