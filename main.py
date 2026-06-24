@@ -1213,10 +1213,10 @@ def presale_find(query: str) -> dict:
             "matches": [{"id": l["id"], "company": l.get("company", ""), "contact": l.get("contact", ""),
                          "stage": l.get("stage", ""), "amount": l.get("amount", 0)} for l in leads]}
 
-def presale_create(company="", contact="", service="", amount=0, stage="", source="", request="", comment="") -> dict:
+def presale_create(company="", contact="", service="", amount=0, stage="", source="", comment="") -> dict:
     return presale_api("POST", "/leads", {
         "company": company, "contact": contact, "service": service, "amount": amount,
-        "stage": stage, "source": source, "request": request, "comment": comment, "who": "Семён",
+        "stage": stage, "source": source, "comment": comment, "who": "Семён",
     })
 
 def presale_update(lead_id, company=None, contact=None, service=None, amount=None, stage=None, comment=None) -> dict:
@@ -1444,7 +1444,7 @@ def execute_tool(name: str, inp: dict) -> dict:
             company=inp.get("company", ""), contact=inp.get("contact", ""),
             service=inp.get("service", ""), amount=inp.get("amount", 0),
             stage=inp.get("stage", ""), source=inp.get("source", ""),
-            request=inp.get("request", ""), comment=inp.get("comment", ""))
+            comment=inp.get("comment", ""))
     elif name == "presale_update":
         return presale_update(
             inp["lead_id"], company=inp.get("company"), contact=inp.get("contact"),
@@ -1666,19 +1666,19 @@ GEMINI_FUNCTIONS = [
          "query": {"type": "string", "description": "Имя, бренд или компания"},
      }}},
     {"name": "presale_create",
-     "description": "Создать новый лид в пресейле. Извлеки из сообщения: контакт (имя человека), компанию/бренд, "
-                    "услугу/запрос, бюджет (amount, число в рублях), источник, статус. "
-                    "Если статус не ясен из смысла — оставь пустым (будет «Не квал»). "
-                    "Перед созданием проверь presale_find, чтобы не задублировать существующего лида.",
+     "description": "Создать новый лид. Раскладывай поля строго: company = ЗАГОЛОВОК лида (как Глеб назвал лид: имя человека/компании, идёт первым; не выдумывай из текста запроса). "
+                    "contact = ТОЛЬКО контактные данные (@ник/телефон/email), без имени и без «Ник:». "
+                    "service = тип услуги из списка (лендинг→«Одностраничный сайт», сайт→«Многостраничный сайт», магазин→«Онлайн-магазин», иначе «Другое»). "
+                    "amount = бюджет числом. comment = суть запроса и договорённости человеческим языком, без префиксов и без дублирования полей; дату встречи пиши в comment. "
+                    "stage оставь пустым, если не ясен. Перед созданием вызови presale_find — проверь дубль.",
      "parameters": {"type": "object", "properties": {
-         "company": {"type": "string", "description": "Компания/бренд"},
-         "contact": {"type": "string", "description": "Имя контакта"},
-         "service": {"type": "string", "description": "Услуга/тип проекта (сайт, брендинг и т.п.)"},
+         "company": {"type": "string", "description": "Заголовок лида: имя клиента/компании, как назвал Глеб"},
+         "contact": {"type": "string", "description": "Только контактные данные: @ник/телефон/email"},
+         "service": {"type": "string", "description": "Тип услуги из списка (Одностраничный сайт, Многостраничный сайт, Онлайн-магазин, Брендинг, …)"},
          "amount":  {"type": "number", "description": "Бюджет в рублях (число), если назван"},
          "stage":   {"type": "string", "description": "Статус, если ясен из смысла"},
          "source":  {"type": "string", "description": "Источник лида (Instagram, реклама, рекомендация…)"},
-         "request": {"type": "string", "description": "Суть запроса клиента"},
-         "comment": {"type": "string", "description": "Исходный текст/детали для истории"},
+         "comment": {"type": "string", "description": "Суть запроса и договорённости (встреча, сроки) человеческим языком"},
      }}},
     {"name": "presale_update",
      "description": "Обновить поля существующего лида и/или добавить комментарий в историю. "
@@ -1842,6 +1842,42 @@ ASSISTANT_TOOL = gtypes.Tool(
     function_declarations=[gtypes.FunctionDeclaration(**f)
                            for f in GEMINI_FUNCTIONS if f["name"] in _ASSISTANT_TOOL_NAMES]
 )
+
+# Роль «presale» — для ветки «Лиды»: ТОЛЬКО инструменты пресейла, доступно любому в чате.
+# Никаких задач/финансов/календаря/переписок — изолированный режим работы с лидами.
+PRESALE_TOOL = gtypes.Tool(
+    function_declarations=[gtypes.FunctionDeclaration(**f)
+                           for f in GEMINI_FUNCTIONS if f["name"].startswith("presale_")]
+)
+
+def make_presale_prompt():
+    now = datetime.now(TZ)
+    day_names = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+    return f"""Ты — Семён, ассистент пресейл-воронки агентства ALTA. Работаешь в ветке «Лиды».
+Сейчас: {now.strftime('%H:%M')} МСК | {day_names[now.weekday()]} {now.strftime('%d.%m.%Y')}. Сегодня: {now.date()}.
+
+ЗАДАЧА: принимать информацию по лидам от ЛЮБОГО человека в этом чате (текст, голос, скриншот) и вести CRM через инструменты presale_*.
+Статусы воронки: «Не квал», «В работе», «Назначена встреча», «Выставлено КП», «Пишем позже»; продажа — «Продано».
+
+РАСКЛАДКА ПОЛЕЙ (не путай):
+• company («Компания/клиент») = ЗАГОЛОВОК лида — ровно то, как назвали лид (имя человека/компании, идёт первым). НЕ придумывай компанию из текста запроса.
+• contact = ТОЛЬКО контактные данные: @ник, телефон, email. Без имени и без «Ник:».
+• service = тип услуги из списка: Брендинг, Многостраничный сайт, Одностраничный сайт, Соцсети, Сопровождение, ИИ контент, Презентация, Онлайн-магазин, Другое. «лендинг/одностраничник»→«Одностраничный сайт»; «сайт»→«Многостраничный сайт»; «магазин»→«Онлайн-магазин».
+• amount = бюджет числом («150к»→150000).
+• comment = суть запроса и договорённости человеческим языком, БЕЗ префиксов («Ник:», «Запрос:») и БЕЗ повтора полей. Дату встречи пиши в comment.
+• stage = статус, если назван/ясен из смысла; иначе оставь пустым (будет «Не квал»).
+
+ПРАВИЛА:
+• Новый лид → presale_find (проверь дубль) → presale_create со всеми полями по схеме. Скриншот переписки/визитки — тоже источник: распознай и вытащи данные.
+• Обновление по лиду → presale_find → presale_update (только изменившиеся поля + comment в историю). Комментарии не перетирай.
+• Смена статуса → presale_find → presale_set_status. «Продано» уводит лида в Продажи.
+• Несколько совпадений в presale_find — НЕ меняй, уточни: «Нашёл несколько: … Кого обновить?».
+• Статус неясен, но есть инфо → presale_add_comment, статус не трогай. Критичные данные не выдумывай.
+• Сводки: «/presale» — кратко по статусам и кто требует действия; «/лиды» список; «/кп» (Выставлено КП); «/позже» (Пишем позже); «/что_сделать» — где нужно действие.
+• После действия — короткое подтверждение по-русски: «Лид создан: Артем Дворец. Статус: В работе. Комментарий добавлен.»
+
+🚫 Здесь ты НЕ обсуждаешь задачи, финансы, планы, календарь Глеба и чужие переписки — только лиды. На посторонние просьбы: «В этой ветке я веду только лиды».
+Действуй сразу: вызывай инструмент в этом же ответе, без «сейчас сделаю». Обычный текст, маркер «•», без markdown-заголовков."""
 
 
 def make_assistant_prompt():
@@ -2051,8 +2087,17 @@ def make_system_prompt():
 ━━━ PRESALE CRM (ветка «Лиды») ━━━
 Когда сообщение помечено [Ветка ЛИДЫ], ты работаешь как менеджер пресейл-воронки ALTA через инструменты presale_*.
 Статусы воронки: «Не квал», «В работе», «Назначена встреча», «Выставлено КП», «Пишем позже»; продажа — «Продано».
+
+РАСКЛАДКА ПОЛЕЙ (очень важно, не путай):
+• company («Компания/клиент») = ЗАГОЛОВОК лида — ровно то, как Глеб назвал лид (обычно имя человека или название компании, идущее первым). Пример: «/лид Артем Дворец …» → company = «Артем Дворец». НИКОГДА не придумывай компанию из текста запроса (нельзя из «лендинг для строительной компании» делать company=«строительная компания»).
+• contact («Контактное лицо») = ТОЛЬКО контактные данные: @ник, телефон или email. Пример: «@art_uglovskij». Не дублируй сюда имя и не пиши «Ник:».
+• service = тип услуги ИЗ СПИСКА: Брендинг, Многостраничный сайт, Одностраничный сайт, Соцсети, Сопровождение, ИИ контент, Презентация, Онлайн-магазин, Другое. Маппинг: «лендинг/одностраничник» → «Одностраничный сайт»; «сайт/многостраничный» → «Многостраничный сайт»; «магазин» → «Онлайн-магазин». Если не ясно — «Другое».
+• amount = бюджет числом в рублях («150к» → 150000).
+• comment = суть запроса и договорённости человеческим языком, БЕЗ технических префиксов («Ник:», «Запрос:») и БЕЗ повтора того, что уже в полях. Дату встречи пиши в comment. Пример: «Нужен лендинг для строительной компании. Встреча 25.06 в 11:00.»
+• stage = статус, если назван или ясен из смысла («встреча назначена» → «Назначена встреча»).
+
 Правила:
-• Новый лид («/лид», «новый лид», свободный текст с именем/брендом) → сначала presale_find по имени/бренду (проверь дубль), затем presale_create. Извлеки контакт, компанию/бренд, услугу, бюджет (число ₽), источник, статус. Если статус неясен — оставь пустым (будет «Не квал»). Исходный текст положи в comment.
+• Новый лид («/лид», «новый лид») → сначала presale_find по имени/бренду (проверь дубль), затем presale_create со ВСЕМИ корректно разложенными полями по схеме выше. Если статус неясен — оставь пустым (будет «Не квал»).
 • Обновление («по Виктории …», «/обновить») → presale_find → presale_update (только изменившиеся поля + comment в историю). Комментарии НЕ перезаписывай и НЕ удаляй.
 • Смена статуса («в КП», «перевести в выставлено КП», «продан») → presale_find → presale_set_status. «Продано» уводит лида в Продажи (текущая логика дашборда).
 • Если presale_find вернул несколько совпадений — НИЧЕГО не меняй, уточни: «Нашёл несколько: … Кого обновить?».
@@ -2060,6 +2105,11 @@ def make_system_prompt():
 • Сводки: «/presale» — кратко (сколько всего и по статусам, кто требует действия); «/лиды» — активные по статусам; «/кп» — presale_list(stage="Выставлено КП"); «/позже» — presale_list(stage="Пишем позже"); «/что_сделать» — лиды, где нужно действие (назначить встречу, отправить/добить КП, напомнить, уточнить бюджет).
 • После каждого действия — короткое подтверждение по-русски: «Лид создан: Виктория / Bonya Beauty. Статус: Не квал. Источник: Instagram. Комментарий добавлен.»
 • Не выдумывай данные. Критичные вещи (какой лид) при сомнении — уточняй, не угадывай.
+
+━━━ ИЗОБРАЖЕНИЯ И СКРИНШОТЫ ━━━
+Ты умеешь читать вложенные картинки. Если пришло фото/скриншот — распознай текст и содержимое и используй как данные.
+В ветке «Лиды» скриншот переписки/визитки = источник для лида: вытащи имя, @ник/контакты, запрос, бюджет, дату встречи и действуй по правилам Presale.
+Если на картинке не хватает данных — скажи, чего не хватает, и при сомнении уточни, а не выдумывай.
 
 ━━━ ДЕЙСТВУЙ СРАЗУ — ЖЕЛЕЗНОЕ ПРАВИЛО №1 ━━━
 Если Глеб просит что-то добавить / создать / перенести / удалить — ВЫЗОВИ нужный инструмент
@@ -2196,15 +2246,17 @@ async def _gemini_generate(contents, config):
     raise last_err if last_err else RuntimeError("Нет доступных моделей")
 
 
-async def process_with_gemini(conv, user_message: str, save_history: bool = True, role: str = "owner") -> str:
+async def process_with_gemini(conv, user_message: str, save_history: bool = True, role: str = "owner",
+                              image: tuple | None = None) -> str:
     """
     conv — ключ изоляции диалога (личка / конкретная ветка-тема).
     role: "owner" — полный доступ; "assistant" — только слоты + запись встречи.
     save_history=False используется для автопостинга.
+    image — необязательный кортеж (bytes, mime_type): вложение-картинка для распознавания.
     """
     conv = str(conv)
     history = db_get_history(conv, limit=20) if save_history else []
-    logger.info(f"Семён[{role}]: models={GEMINI_MODELS}, conv={conv}, history={len(history)}, save={save_history}")
+    logger.info(f"Семён[{role}]: models={GEMINI_MODELS}, conv={conv}, history={len(history)}, save={save_history}, image={bool(image)}")
 
     contents = []
     for h_role, content in history:
@@ -2213,16 +2265,25 @@ async def process_with_gemini(conv, user_message: str, save_history: bool = True
             role=gemini_role,
             parts=[gtypes.Part.from_text(text=content)]
         ))
-    contents.append(gtypes.Content(
-        role="user",
-        parts=[gtypes.Part.from_text(text=user_message)]
-    ))
+    user_parts = [gtypes.Part.from_text(text=user_message)]
+    if image:
+        try:
+            img_bytes, img_mime = image
+            user_parts.append(gtypes.Part.from_bytes(data=img_bytes, mime_type=img_mime or "image/jpeg"))
+        except Exception as e:
+            logger.warning(f"image part: {e}")
+    contents.append(gtypes.Content(role="user", parts=user_parts))
 
     # Роль определяет и промпт, и набор инструментов
     if role == "assistant":
         config = gtypes.GenerateContentConfig(
             system_instruction=make_assistant_prompt(),
             tools=[ASSISTANT_TOOL],
+        )
+    elif role == "presale":
+        config = gtypes.GenerateContentConfig(
+            system_instruction=make_presale_prompt(),
+            tools=[PRESALE_TOOL],
         )
     else:
         config = gtypes.GenerateContentConfig(
@@ -2718,17 +2779,17 @@ def _can_reply_here(update: Update) -> bool:
     return chat.id == GROUP_ID   # только управляющая группа «alta трекинг»
 
 
-async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, image: tuple | None = None, force_role: str | None = None):
     if not _can_reply_here(update):
         return
-    role = user_role(update.effective_user.id)
+    role = force_role or user_role(update.effective_user.id)
     if role is None:
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         thread_id = update.message.message_thread_id if update.message else None
         conv = conv_key(update.effective_chat.id, thread_id)
-        text = await process_with_gemini(conv, prompt, role=role)
+        text = await process_with_gemini(conv, prompt, role=role, image=image)
         await send_html(None, text, reply_to=update.message, thread_id=thread_id)
     except Exception as e:
         logger.error(f"send_reply error: {e}", exc_info=True)
@@ -2942,11 +3003,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat and chat.type in ("group", "supergroup", "channel") and chat.id not in (GROUP_ID, PRESALE_GROUP_ID):
         return
     user_id = update.effective_user.id
-    # презейл-чат: только ветка «Лиды» и только тот, у кого есть роль (владелец)
+    # презейл-чат, ветка «Лиды»: лид может завести ЛЮБОЙ участник чата (отдельный режим presale).
+    # Ограничения доступа из других чатов сюда не распространяются.
     if chat and chat.id == PRESALE_GROUP_ID:
-        if not is_presale_thread(update) or user_role(user_id) is None:
+        if not is_presale_thread(update):
             return
-        await send_reply(update, context, f"[Ветка ЛИДЫ] {update.message.text}")
+        await send_reply(update, context, f"[Ветка ЛИДЫ] {update.message.text}", force_role="presale")
         return
     if update.effective_chat.id == GROUP_ID and not is_allowed(user_id):
         return
@@ -2984,7 +3046,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not _can_reply_here(update):   # в чужих группах не отвечаем голосом
         return
-    if not is_allowed(update.effective_user.id):
+    presale = is_presale_thread(update)
+    if not presale and not is_allowed(update.effective_user.id):   # в ветке «Лиды» — можно любому
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     buf = io.BytesIO()
@@ -2995,18 +3058,58 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     thread_context = get_thread_context(update)
     prompt = text
-    if is_presale_thread(update):  prompt = f"[Ветка ЛИДЫ] {text}"
+    if presale:                      prompt = f"[Ветка ЛИДЫ] {text}"
     elif thread_context == "day":    prompt = f"[Тред ПЛАН ДНЯ] {text}"
     elif thread_context == "week": prompt = f"[Тред ПЛАН НЕДЕЛИ] {text}"
-    await send_reply(update, context, prompt)
+    await send_reply(update, context, prompt, force_role="presale" if presale else None)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Распознавание изображений/скриншотов: фото или документ-картинка."""
+    if not update.message:
+        return
+    if not _can_reply_here(update):
+        return
+    presale = is_presale_thread(update)
+    if not presale and not is_allowed(update.effective_user.id):   # в ветке «Лиды» — можно любому
+        return
+    # источник картинки: сжатое фото или документ с image-mime
+    file_id, mime = None, "image/jpeg"
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id            # самое крупное
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        file_id = update.message.document.file_id
+        mime = update.message.document.mime_type
+    if not file_id:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        buf = io.BytesIO()
+        await (await context.bot.get_file(file_id)).download_to_memory(buf)
+        img = (buf.getvalue(), mime)
+    except Exception as e:
+        logger.warning(f"handle_photo download: {e}")
+        return
+    caption = (update.message.caption or "").strip()
+    base = caption or ("Это вложение — изображение/скриншот. Прочитай текст и содержимое, "
+                       "извлеки полезные данные и действуй по контексту переписки.")
+    if presale:
+        base = f"[Ветка ЛИДЫ] {base}"
+    else:
+        tc = get_thread_context(update)
+        if tc == "day":    base = f"[Тред ПЛАН ДНЯ] {base}"
+        elif tc == "week": base = f"[Тред ПЛАН НЕДЕЛИ] {base}"
+    await send_reply(update, context, base, image=img, force_role="presale" if presale else None)
 
 
 async def cmd_presale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if user_role(update.effective_user.id) is None:
+    presale = is_presale_thread(update)
+    if not presale and user_role(update.effective_user.id) is None:
         return
     await send_reply(update, context,
         "[Ветка ЛИДЫ] /presale — дай краткую сводку по пресейл-воронке: "
-        "сколько лидов всего, сколько в каждом статусе и кто требует действия.")
+        "сколько лидов всего, сколько в каждом статусе и кто требует действия.",
+        force_role="presale" if presale else None)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -3052,6 +3155,7 @@ def main():
     app.add_handler(CommandHandler("presale",    cmd_presale))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     # Telegram Business: наблюдение за личными клиентскими чатами (только запись)
     app.add_handler(TypeHandler(Update, on_business_update), group=1)
     # Наблюдение за группами/каналами, куда добавлен бот (только запись, без ответов)
