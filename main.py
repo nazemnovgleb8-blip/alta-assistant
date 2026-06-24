@@ -18,6 +18,7 @@ import io
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -59,6 +60,12 @@ THREAD_DAY         = int(os.getenv("THREAD_DAY", "9"))
 THREAD_WEEK        = int(os.getenv("THREAD_WEEK", "7"))
 THREAD_MONTH       = int(os.getenv("THREAD_MONTH", "6"))
 
+# Presale-чат и ветка «Лиды» (https://t.me/c/3306626477/110)
+PRESALE_GROUP_ID   = int(os.getenv("PRESALE_GROUP_ID", "-1003306626477"))
+PRESALE_TOPIC_ID   = int(os.getenv("PRESALE_TOPIC_ID", "110"))
+# База presale-API дашборда (по умолчанию выводится из FINANCE_API_URL)
+PRESALE_API_BASE   = os.getenv("PRESALE_API_BASE", "")
+
 GOOGLE_TOKEN_FILE  = os.getenv("GOOGLE_TOKEN_FILE", "token.pickle")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 # OAuth client config — нужно чтобы обновлять access-токен, если в token.pickle этих полей нет
@@ -83,7 +90,7 @@ if "gemini-3.1-flash-lite" not in GEMINI_MODELS:
     GEMINI_MODELS.append("gemini-3.1-flash-lite")
 GEMINI_MODELS = list(dict.fromkeys(GEMINI_MODELS))   # дедуп с сохранением порядка
 GEMINI_MODEL = GEMINI_MODELS[0]                       # основная модель (для логов)
-VERSION = "8.2"
+VERSION = "8.3"
 
 AUTO_CHECKIN_ENABLED = os.getenv("AUTO_CHECKIN_ENABLED", "true").lower() == "true"
 AUTO_CHECKIN_TIME    = os.getenv("AUTO_CHECKIN_TIME", "18:00")
@@ -166,6 +173,7 @@ _TOOL_NAMES_RE = (
     "complete_task|delete_task|list_tasks|list_google_tasks|complete_google_task|"
     "delete_google_task|add_calendar_event|update_calendar_event|delete_calendar_event|"
     "get_calendar_events|get_daily_summary|get_weekly_summary|get_business_kpi|"
+    "presale_list|presale_find|presale_create|presale_update|presale_set_status|presale_add_comment|"
     "add_waiting|list_waiting|resolve_waiting"
 )
 
@@ -1152,6 +1160,83 @@ def fetch_business_kpi(force: bool = False) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+# ─── Presale CRM (токен-API дашборда) ─────────────────────────────────────────
+def _presale_base() -> str:
+    if PRESALE_API_BASE:
+        return PRESALE_API_BASE.rstrip("/")
+    if FINANCE_API_URL:
+        return FINANCE_API_URL.split("/api/kpi")[0].rstrip("/")
+    return ""
+
+def presale_api(method: str, path: str, payload: dict | None = None) -> dict:
+    base = _presale_base()
+    if not base or not FINANCE_API_TOKEN:
+        return {"ok": False, "error": "Presale API не настроен (нет FINANCE_API_URL/TOKEN)"}
+    url = f"{base}/api/presale{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Authorization": f"Bearer {FINANCE_API_TOKEN}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        if "ok" not in body:
+            body["ok"] = True
+        return body
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            body = {"error": f"HTTP {e.code}"}
+        body["ok"] = False
+        return body
+    except Exception as e:
+        logger.warning(f"presale_api {method} {path}: {e}")
+        return {"ok": False, "error": str(e)}
+
+def presale_list(stage: str | None = None) -> dict:
+    q = f"?stage={urllib.parse.quote(stage)}" if stage else ""
+    return presale_api("GET", f"/leads{q}")
+
+def presale_find(query: str) -> dict:
+    """Ищет лидов по подстроке в названии/контакте (для дизамбигуации)."""
+    res = presale_api("GET", "/leads")
+    if not res.get("ok"):
+        return res
+    q = (query or "").strip().lower()
+    leads = res.get("leads", [])
+    if q:
+        leads = [l for l in leads
+                 if q in (l.get("company", "").lower()) or q in (l.get("contact", "").lower())]
+    return {"ok": True, "count": len(leads),
+            "matches": [{"id": l["id"], "company": l.get("company", ""), "contact": l.get("contact", ""),
+                         "stage": l.get("stage", ""), "amount": l.get("amount", 0)} for l in leads]}
+
+def presale_create(company="", contact="", service="", amount=0, stage="", source="", request="", comment="") -> dict:
+    return presale_api("POST", "/leads", {
+        "company": company, "contact": contact, "service": service, "amount": amount,
+        "stage": stage, "source": source, "request": request, "comment": comment, "who": "Семён",
+    })
+
+def presale_update(lead_id, company=None, contact=None, service=None, amount=None, stage=None, comment=None) -> dict:
+    payload = {"who": "Семён"}
+    for k, v in (("company", company), ("contact", contact), ("service", service),
+                 ("amount", amount), ("stage", stage), ("comment", comment)):
+        if v is not None:
+            payload[k] = v
+    return presale_api("PATCH", f"/leads/{lead_id}", payload)
+
+def presale_set_status(lead_id, stage, comment=None) -> dict:
+    payload = {"stage": stage, "who": "Семён"}
+    if comment:
+        payload["comment"] = comment
+    return presale_api("PATCH", f"/leads/{lead_id}/status", payload)
+
+def presale_add_comment(lead_id, text) -> dict:
+    return presale_api("POST", f"/leads/{lead_id}/comment", {"text": text, "who": "Семён"})
+
+
 def execute_tool(name: str, inp: dict) -> dict:
     inp = dict(inp)  # копируем чтобы не мутировать оригинал
     now = datetime.now(TZ)
@@ -1349,6 +1434,27 @@ def execute_tool(name: str, inp: dict) -> dict:
     elif name == "get_business_kpi":
         return fetch_business_kpi(force=inp.get("force", False))
 
+    # ── Presale CRM ──
+    elif name == "presale_list":
+        return presale_list(inp.get("stage"))
+    elif name == "presale_find":
+        return presale_find(inp.get("query", ""))
+    elif name == "presale_create":
+        return presale_create(
+            company=inp.get("company", ""), contact=inp.get("contact", ""),
+            service=inp.get("service", ""), amount=inp.get("amount", 0),
+            stage=inp.get("stage", ""), source=inp.get("source", ""),
+            request=inp.get("request", ""), comment=inp.get("comment", ""))
+    elif name == "presale_update":
+        return presale_update(
+            inp["lead_id"], company=inp.get("company"), contact=inp.get("contact"),
+            service=inp.get("service"), amount=inp.get("amount"),
+            stage=inp.get("stage"), comment=inp.get("comment"))
+    elif name == "presale_set_status":
+        return presale_set_status(inp["lead_id"], inp["stage"], comment=inp.get("comment"))
+    elif name == "presale_add_comment":
+        return presale_add_comment(inp["lead_id"], inp.get("text", ""))
+
     # ── Актуальные планы недели/месяца ──
     elif name == "set_plan":
         kind = inp["kind"]  # week | month
@@ -1542,6 +1648,64 @@ GEMINI_FUNCTIONS = [
                     "или когда нужно понять, что реально двигает бизнес и где узкое место.",
      "parameters": {"type": "object", "properties": {
          "force": {"type": "boolean", "description": "Принудительно обновить, минуя кэш (по умолчанию false)"},
+     }}},
+
+    # ── Presale CRM (раздел «Пресейл» в дашборде) ──
+    {"name": "presale_list",
+     "description": "Список лидов из пресейл-воронки. Можно отфильтровать по статусу. "
+                    "Статусы: «Не квал», «В работе», «Назначена встреча», «Выставлено КП», «Пишем позже». "
+                    "Используй для сводок (/presale, /лиды, /кп, /позже, /что_сделать).",
+     "parameters": {"type": "object", "properties": {
+         "stage": {"type": "string", "description": "Фильтр по статусу (необязательно)"},
+     }}},
+    {"name": "presale_find",
+     "description": "Найти лида по имени контакта или названию компании/бренда (подстрока). "
+                    "ВСЕГДА вызывай перед обновлением/сменой статуса, чтобы найти нужный id и проверить дубли. "
+                    "Если совпадений несколько — НЕ меняй данные, а уточни у Глеба, какой именно лид.",
+     "parameters": {"type": "object", "required": ["query"], "properties": {
+         "query": {"type": "string", "description": "Имя, бренд или компания"},
+     }}},
+    {"name": "presale_create",
+     "description": "Создать новый лид в пресейле. Извлеки из сообщения: контакт (имя человека), компанию/бренд, "
+                    "услугу/запрос, бюджет (amount, число в рублях), источник, статус. "
+                    "Если статус не ясен из смысла — оставь пустым (будет «Не квал»). "
+                    "Перед созданием проверь presale_find, чтобы не задублировать существующего лида.",
+     "parameters": {"type": "object", "properties": {
+         "company": {"type": "string", "description": "Компания/бренд"},
+         "contact": {"type": "string", "description": "Имя контакта"},
+         "service": {"type": "string", "description": "Услуга/тип проекта (сайт, брендинг и т.п.)"},
+         "amount":  {"type": "number", "description": "Бюджет в рублях (число), если назван"},
+         "stage":   {"type": "string", "description": "Статус, если ясен из смысла"},
+         "source":  {"type": "string", "description": "Источник лида (Instagram, реклама, рекомендация…)"},
+         "request": {"type": "string", "description": "Суть запроса клиента"},
+         "comment": {"type": "string", "description": "Исходный текст/детали для истории"},
+     }}},
+    {"name": "presale_update",
+     "description": "Обновить поля существующего лида и/или добавить комментарий в историю. "
+                    "Сначала найди лида через presale_find. Передавай только изменившиеся поля. "
+                    "Комментарий не перезаписывает старое — он добавляется в историю.",
+     "parameters": {"type": "object", "required": ["lead_id"], "properties": {
+         "lead_id": {"type": "number", "description": "ID лида из presale_find"},
+         "company": {"type": "string"}, "contact": {"type": "string"},
+         "service": {"type": "string"}, "amount": {"type": "number"},
+         "stage":   {"type": "string", "description": "Новый статус (если меняется)"},
+         "comment": {"type": "string", "description": "Что добавить в историю лида"},
+     }}},
+    {"name": "presale_set_status",
+     "description": "Сменить статус лида. Статусы: «Не квал», «В работе», «Назначена встреча», «Выставлено КП», «Пишем позже», "
+                    "а также «Продано» — при «Продано» лид по текущей логике дашборда переходит в раздел Продажи. "
+                    "Меняй статус только при явном сигнале или высокой уверенности. Сначала найди лида через presale_find.",
+     "parameters": {"type": "object", "required": ["lead_id", "stage"], "properties": {
+         "lead_id": {"type": "number", "description": "ID лида из presale_find"},
+         "stage":   {"type": "string", "description": "Новый статус"},
+         "comment": {"type": "string", "description": "Комментарий к изменению (необязательно)"},
+     }}},
+    {"name": "presale_add_comment",
+     "description": "Добавить комментарий в историю лида, ничего не меняя в полях. "
+                    "Используй, когда статус неясен, но есть новая информация по лиду.",
+     "parameters": {"type": "object", "required": ["lead_id", "text"], "properties": {
+         "lead_id": {"type": "number", "description": "ID лида из presale_find"},
+         "text":    {"type": "string", "description": "Текст комментария"},
      }}},
 
     # ── Цели и фокус ──
@@ -1883,6 +2047,19 @@ def make_system_prompt():
 «кому я не ответил», «что там по …») — вызывай read_client_chats и отвечай по реальным сообщениям. НЕ говори «я не читаю чаты» —
 доступ есть. Опирайся только на данные из инструмента, не выдумывай. Истории до момента подключения нет — это нормально.
 🚫 Ты НИКОГДА не пишешь в чаты/группы сам и не предлагаешь сделать это за тебя — только наблюдаешь, отвечаешь Глебу и подсказываешь, кому/что написать.
+
+━━━ PRESALE CRM (ветка «Лиды») ━━━
+Когда сообщение помечено [Ветка ЛИДЫ], ты работаешь как менеджер пресейл-воронки ALTA через инструменты presale_*.
+Статусы воронки: «Не квал», «В работе», «Назначена встреча», «Выставлено КП», «Пишем позже»; продажа — «Продано».
+Правила:
+• Новый лид («/лид», «новый лид», свободный текст с именем/брендом) → сначала presale_find по имени/бренду (проверь дубль), затем presale_create. Извлеки контакт, компанию/бренд, услугу, бюджет (число ₽), источник, статус. Если статус неясен — оставь пустым (будет «Не квал»). Исходный текст положи в comment.
+• Обновление («по Виктории …», «/обновить») → presale_find → presale_update (только изменившиеся поля + comment в историю). Комментарии НЕ перезаписывай и НЕ удаляй.
+• Смена статуса («в КП», «перевести в выставлено КП», «продан») → presale_find → presale_set_status. «Продано» уводит лида в Продажи (текущая логика дашборда).
+• Если presale_find вернул несколько совпадений — НИЧЕГО не меняй, уточни: «Нашёл несколько: … Кого обновить?».
+• Если статус неясен, но есть инфо — просто presale_add_comment, статус не трогай.
+• Сводки: «/presale» — кратко (сколько всего и по статусам, кто требует действия); «/лиды» — активные по статусам; «/кп» — presale_list(stage="Выставлено КП"); «/позже» — presale_list(stage="Пишем позже"); «/что_сделать» — лиды, где нужно действие (назначить встречу, отправить/добить КП, напомнить, уточнить бюджет).
+• После каждого действия — короткое подтверждение по-русски: «Лид создан: Виктория / Bonya Beauty. Статус: Не квал. Источник: Instagram. Комментарий добавлен.»
+• Не выдумывай данные. Критичные вещи (какой лид) при сомнении — уточняй, не угадывай.
 
 ━━━ ДЕЙСТВУЙ СРАЗУ — ЖЕЛЕЗНОЕ ПРАВИЛО №1 ━━━
 Если Глеб просит что-то добавить / создать / перенести / удалить — ВЫЗОВИ нужный инструмент
@@ -2284,7 +2461,7 @@ async def observe_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         if not msg or not chat:
             return
-        if chat.id == GROUP_ID:               # управляющую группу не трекаем
+        if chat.id in (GROUP_ID, PRESALE_GROUP_ID):   # управляющую группу и презейл-чат не трекаем
             return
         if chat.type not in ("group", "supergroup", "channel"):
             return
@@ -2516,6 +2693,17 @@ def get_thread_context(update: Update) -> str | None:
     return None
 
 
+def is_presale_thread(update: Update) -> bool:
+    """True только для ветки «Лиды» презейл-чата."""
+    m = update.message
+    chat = update.effective_chat
+    if not m or not chat or not PRESALE_GROUP_ID:
+        return False
+    if chat.id != PRESALE_GROUP_ID:
+        return False
+    return PRESALE_TOPIC_ID == 0 or m.message_thread_id == PRESALE_TOPIC_ID
+
+
 # ─── Telegram Handlers ────────────────────────────────────────────────────────
 def _can_reply_here(update: Update) -> bool:
     """ЖЁСТКИЙ замок: Семён отвечает ТОЛЬКО в личке (владелец/сотрудник) и в управляющей группе.
@@ -2525,6 +2713,8 @@ def _can_reply_here(update: Update) -> bool:
         return False
     if chat.type == "private":
         return user_role(update.effective_user.id) is not None
+    if chat.id == PRESALE_GROUP_ID:        # презейл-чат — только ветка «Лиды»
+        return is_presale_thread(update)
     return chat.id == GROUP_ID   # только управляющая группа «alta трекинг»
 
 
@@ -2747,11 +2937,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     chat = update.effective_chat
-    # Отвечаем ТОЛЬКО в личке (владелец/сотрудник) и в управляющей группе.
-    # Чужие группы/каналы НЕ трогаем — их только наблюдаем (observe_chat), Семён там не пишет.
-    if chat and chat.type in ("group", "supergroup", "channel") and chat.id != GROUP_ID:
+    # Отвечаем ТОЛЬКО в личке (владелец/сотрудник), в управляющей группе и в ветке «Лиды» презейл-чата.
+    # Прочие группы/каналы НЕ трогаем — их только наблюдаем (observe_chat), Семён там не пишет.
+    if chat and chat.type in ("group", "supergroup", "channel") and chat.id not in (GROUP_ID, PRESALE_GROUP_ID):
         return
     user_id = update.effective_user.id
+    # презейл-чат: только ветка «Лиды» и только тот, у кого есть роль (владелец)
+    if chat and chat.id == PRESALE_GROUP_ID:
+        if not is_presale_thread(update) or user_role(user_id) is None:
+            return
+        await send_reply(update, context, f"[Ветка ЛИДЫ] {update.message.text}")
+        return
     if update.effective_chat.id == GROUP_ID and not is_allowed(user_id):
         return
     text = update.message.text
@@ -2799,9 +2995,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     thread_context = get_thread_context(update)
     prompt = text
-    if thread_context == "day":    prompt = f"[Тред ПЛАН ДНЯ] {text}"
+    if is_presale_thread(update):  prompt = f"[Ветка ЛИДЫ] {text}"
+    elif thread_context == "day":    prompt = f"[Тред ПЛАН ДНЯ] {text}"
     elif thread_context == "week": prompt = f"[Тред ПЛАН НЕДЕЛИ] {text}"
     await send_reply(update, context, prompt)
+
+
+async def cmd_presale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if user_role(update.effective_user.id) is None:
+        return
+    await send_reply(update, context,
+        "[Ветка ЛИДЫ] /presale — дай краткую сводку по пресейл-воронке: "
+        "сколько лидов всего, сколько в каждом статусе и кто требует действия.")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -2844,6 +3049,7 @@ def main():
     app.add_handler(CommandHandler("setmonth",   cmd_setmonth))
     app.add_handler(CommandHandler("showplan",   cmd_showplan))
     app.add_handler(CommandHandler("biz",        cmd_biz))
+    app.add_handler(CommandHandler("presale",    cmd_presale))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     # Telegram Business: наблюдение за личными клиентскими чатами (только запись)
